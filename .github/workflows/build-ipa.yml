@@ -23,6 +23,12 @@ jobs:
       - name: Install build tools
         run: brew install autoconf automake cmake libtool meson ninja pkg-config qemu xcodegen
 
+      - name: Install Python modules needed by Meson
+        run: |
+          PYTHON_PACKAGES="$RUNNER_TEMP/python-packages"
+          python3 -m pip install --target "$PYTHON_PACKAGES" PyYAML
+          echo "PYTHONPATH=$PYTHON_PACKAGES${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
+
       - name: Set up Rust for iOS
         uses: dtolnay/rust-toolchain@stable
         with:
