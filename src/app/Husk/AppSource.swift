@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 import Foundation
 
 // MARK: - Internal Model
@@ -21,6 +22,18 @@ enum SourceArtifact: String, Equatable {
     }
 }
 
+struct SourceVersion: Identifiable, Equatable {
+    let version: String
+    let downloadURL: String
+    let sizeBytes: Int64
+    let sha256: String?
+    let minimumSDK: Int?
+    let targetSDK: Int?
+    let architectures: [String]
+    let artifact: SourceArtifact
+    var id: String { downloadURL }
+}
+
 struct SourceApp: Identifiable, Equatable {
     let name: String
     let bundleIdentifier: String
@@ -35,7 +48,110 @@ struct SourceApp: Identifiable, Equatable {
     let targetSDK: Int?
     let architectures: [String]
     let artifact: SourceArtifact
+    let versions: [SourceVersion]
     var id: String { bundleIdentifier }
+
+    var latestVersion: SourceVersion {
+        versions.first ?? SourceVersion(version: version, downloadURL: downloadURL, sizeBytes: sizeBytes,
+                                        sha256: sha256, minimumSDK: minimumSDK, targetSDK: targetSDK,
+                                        architectures: architectures, artifact: artifact)
+    }
+    var versionOptions: [SourceVersion] { versions.isEmpty ? [latestVersion] : versions }
+}
+
+private enum RepositoryError: LocalizedError {
+    case untrustedURL, invalidIndex, indexTooLarge
+
+    var errorDescription: String? {
+        switch self {
+        case .untrustedURL: return "Repository and artifact URLs must use HTTPS and must not contain credentials."
+        case .invalidIndex: return "The repository index contains invalid app metadata."
+        case .indexTooLarge: return "The repository index exceeds Husk's 96 MB safety limit."
+        }
+    }
+}
+
+/// Streams a repository index with a hard byte cap rather than buffering an unbounded response in URLSession.data(from:).
+private final class BoundedRepositoryLoader: NSObject, URLSessionDataDelegate {
+    private let limit: Int
+    private var continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>?
+    private var response: HTTPURLResponse?
+    private var data = Data()
+    private var session: URLSession?
+    private var task: URLSessionDataTask?
+
+    init(limit: Int) { self.limit = limit }
+
+    func load(_ url: URL) async throws -> (Data, HTTPURLResponse) {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>) in
+            self.continuation = continuation
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.timeoutIntervalForRequest = 60
+            configuration.timeoutIntervalForResource = 180
+            configuration.urlCache = nil
+            let queue = OperationQueue()
+            queue.maxConcurrentOperationCount = 1
+            session = URLSession(configuration: configuration, delegate: self, delegateQueue: queue)
+            task = session?.dataTask(with: url)
+            task?.resume()
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        guard let url = request.url, url.scheme?.lowercased() == "https", url.host != nil,
+              url.user == nil, url.password == nil else {
+            completionHandler(nil)
+            finish(.failure(RepositoryError.untrustedURL))
+            return
+        }
+        completionHandler(request)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let http = response as? HTTPURLResponse else {
+            finish(.failure(RepositoryError.invalidIndex))
+            completionHandler(.cancel)
+            return
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            finish(.failure(URLError(.badServerResponse, userInfo: [NSLocalizedDescriptionKey: "Repository returned HTTP \(http.statusCode)."])))
+            completionHandler(.cancel)
+            return
+        }
+        if http.expectedContentLength > Int64(limit) {
+            finish(.failure(RepositoryError.indexTooLarge))
+            completionHandler(.cancel)
+            return
+        }
+        self.response = http
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
+        guard chunk.count <= limit - data.count else {
+            finish(.failure(RepositoryError.indexTooLarge))
+            dataTask.cancel()
+            return
+        }
+        data.append(chunk)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error { finish(.failure(error)); return }
+        guard let response else { finish(.failure(RepositoryError.invalidIndex)); return }
+        finish(.success((data, response)))
+    }
+
+    private func finish(_ result: Result<(Data, HTTPURLResponse), Error>) {
+        guard let continuation else { return }
+        self.continuation = nil
+        continuation.resume(with: result)
+        session?.finishTasksAndInvalidate()
+        session = nil
+        task = nil
+    }
 }
 
 // MARK: - F-Droid v1 Schema
@@ -85,6 +201,17 @@ private struct SourceAppCodable: Codable {
     let targetSDK: Int?
     let architectures: [String]?
     let downloadFormat: String?
+    let versions: [SourceVersionCodable]?
+}
+private struct SourceVersionCodable: Codable {
+    let version: String
+    let downloadURL: String
+    let sizeBytes: Int64?
+    let sha256: String?
+    let minimumSDK: Int?
+    let targetSDK: Int?
+    let architectures: [String]?
+    let downloadFormat: String?
 }
 
 // MARK: - Manager
@@ -106,12 +233,44 @@ final class SourceManager: ObservableObject {
         }
     }
 
-    private let session: URLSession = {
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 120
-        cfg.timeoutIntervalForResource = 300
-        return URLSession(configuration: cfg)
-    }()
+    private static let maxIndexBytes = 96 << 20
+
+    private static func trustedURL(_ raw: String, relativeTo base: URL? = nil) -> URL? {
+        guard let url = URL(string: raw, relativeTo: base)?.absoluteURL,
+              url.scheme?.lowercased() == "https", url.host != nil,
+              url.user == nil, url.password == nil else { return nil }
+        return url
+    }
+
+    private static func validPackageName(_ value: String) -> Bool {
+        value.range(of: "^[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+$", options: .regularExpression) != nil
+    }
+
+    private static func sourceVersion(version: String, downloadURL rawURL: String, sizeBytes: Int64?, sha256: String?,
+                                      minimumSDK: Int?, targetSDK: Int?, architectures: [String]?, downloadFormat: String?,
+                                      relativeTo baseURL: URL? = nil, requireAPKExtension: Bool = false) -> SourceVersion? {
+        guard !version.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              (sizeBytes ?? 0) >= 0, let url = trustedURL(rawURL, relativeTo: baseURL) else { return nil }
+        let format = downloadFormat?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+        let extensionName = url.pathExtension.lowercased()
+        let declaredArtifact = format.flatMap { SourceArtifact(rawValue: $0) }
+        let extensionArtifact = SourceArtifact(rawValue: extensionName)
+        guard format == nil || format?.isEmpty == true || declaredArtifact != nil,
+              extensionName.isEmpty || extensionArtifact != nil,
+              declaredArtifact == nil || extensionArtifact == nil || declaredArtifact == extensionArtifact,
+              !requireAPKExtension || extensionName == "apk" else { return nil }
+        let checksum: String?
+        if let sha256 {
+            guard sha256.range(of: "^[0-9a-fA-F]{64}$", options: .regularExpression) != nil else { return nil }
+            checksum = sha256.lowercased()
+        } else {
+            checksum = nil
+        }
+        return SourceVersion(version: version, downloadURL: url.absoluteString, sizeBytes: sizeBytes ?? 0,
+                             sha256: checksum, minimumSDK: minimumSDK, targetSDK: targetSDK,
+                             architectures: architectures ?? [], artifact: declaredArtifact ?? extensionArtifact ?? .apk)
+    }
 
     init() {
         if let saved = UserDefaults.standard.stringArray(forKey: "HuskSourceURLs"), !saved.isEmpty {
@@ -128,90 +287,117 @@ final class SourceManager: ObservableObject {
         }
     }
 
-    // Add a new source and fetch ONLY that one
+    // Add a new source and fetch ONLY that one.
     func addSource(urlString: String) async {
-        guard !sourceURLs.contains(urlString) else { return }
-        sourceURLs.append(urlString)
-        await fetchSource(urlString: urlString)
+        guard let url = Self.trustedURL(urlString) else {
+            fetchErrors[urlString] = RepositoryError.untrustedURL.localizedDescription
+            return
+        }
+        let normalized = url.absoluteString
+        guard !sourceURLs.contains(normalized) else { return }
+        sourceURLs.append(normalized)
+        await fetchSource(urlString: normalized)
     }
 
-    // Fetch a single source by URL
+    // Fetch a single source by URL.
     func fetchSource(urlString: String) async {
-        guard let url = URL(string: urlString),
-              let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
-              url.host != nil else {
-            fetchErrors[urlString] = "Invalid repository URL"
+        guard let url = Self.trustedURL(urlString) else {
+            fetchErrors[urlString] = RepositoryError.untrustedURL.localizedDescription
             return
         }
 
         loadingSources.insert(urlString)
         fetchErrors.removeValue(forKey: urlString)
-
         defer { loadingSources.remove(urlString) }
 
         do {
-            let (data, response) = try await session.data(from: url)
-            guard let http = response as? HTTPURLResponse else {
-                fetchErrors[urlString] = "Repository did not return an HTTP response."
-                return
-            }
-            guard (200..<300).contains(http.statusCode) else {
-                fetchErrors[urlString] = "Repository returned HTTP \(http.statusCode)."
-                return
-            }
+            let (data, _) = try await BoundedRepositoryLoader(limit: Self.maxIndexBytes).load(url)
+            var rejected = 0
 
-            // Try F-Droid v1 format
             if let fdroid = try? JSONDecoder().decode(FDroidIndex.self, from: data) {
-                let baseURL = fdroid.repo.address.hasSuffix("/") ? String(fdroid.repo.address.dropLast()) : fdroid.repo.address
+                guard !fdroid.repo.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      fdroid.apps.count <= 100_000,
+                      let baseURL = Self.trustedURL(fdroid.repo.address),
+                      let baseDirectory = URL(string: baseURL.absoluteString.hasSuffix("/") ? baseURL.absoluteString : baseURL.absoluteString + "/") else {
+                    throw RepositoryError.invalidIndex
+                }
                 var apps: [SourceApp] = []
+                var seen = Set<String>()
                 for fApp in fdroid.apps {
-                    guard let pkgs = fdroid.packages[fApp.packageName],
-                          let latest = pkgs.max(by: { ($0.versionCode ?? 0) < ($1.versionCode ?? 0) }) ?? pkgs.first else { continue }
-                    let loc = fApp.localized?["en-US"] ?? fApp.localized?.values.first
-                    let appName = fApp.name ?? loc?.name ?? fApp.packageName
-                    let appSummary = fApp.summary ?? loc?.summary ?? fApp.description ?? loc?.description ?? ""
-                    let appIcon = fApp.icon ?? loc?.icon
-                    let iconURL = appIcon.map { "\(baseURL)/icons/\($0)" } ?? ""
-                    let downloadURL = URL(string: latest.apkName, relativeTo: URL(string: baseURL + "/"))?.absoluteURL.absoluteString
-                        ?? "\(baseURL)/\(latest.apkName)"
-                    let sha256 = latest.hashType?.caseInsensitiveCompare("sha256") == .orderedSame ? latest.hash : nil
-
-                    apps.append(SourceApp(
-                        name: appName,
-                        bundleIdentifier: fApp.packageName,
-                        version: latest.versionName,
-                        downloadURL: downloadURL,
-                        iconURL: iconURL,
-                        localizedDescription: appSummary,
-                        categories: fApp.categories ?? [],
-                        sizeBytes: latest.size ?? 0,
-                        sha256: sha256,
-                        minimumSDK: latest.minSdkVersion,
-                        targetSDK: latest.targetSdkVersion,
-                        architectures: latest.nativecode ?? [],
-                        artifact: .apk
-                    ))
+                    guard Self.validPackageName(fApp.packageName), seen.insert(fApp.packageName).inserted else { rejected += 1; continue }
+                    guard let packages = fdroid.packages[fApp.packageName] else { continue }
+                    let sortedPackages = packages.sorted { ($0.versionCode ?? 0) > ($1.versionCode ?? 0) }
+                    var versions: [SourceVersion] = []
+                    var seenVersionURLs = Set<String>()
+                    for package in sortedPackages.prefix(100_000) {
+                        let checksum = package.hashType?.caseInsensitiveCompare("sha256") == .orderedSame ? package.hash : nil
+                        guard let version = Self.sourceVersion(version: package.versionName, downloadURL: package.apkName,
+                                                               sizeBytes: package.size, sha256: checksum,
+                                                               minimumSDK: package.minSdkVersion, targetSDK: package.targetSdkVersion,
+                                                               architectures: package.nativecode, downloadFormat: nil,
+                                                               relativeTo: baseDirectory, requireAPKExtension: true) else {
+                            rejected += 1
+                            continue
+                        }
+                        if seenVersionURLs.insert(version.downloadURL).inserted { versions.append(version) }
+                    }
+                    guard let latest = versions.first else { continue }
+                    let localized = fApp.localized?["en-US"] ?? fApp.localized?.values.first
+                    let appName = fApp.name ?? localized?.name ?? fApp.packageName
+                    let appSummary = fApp.summary ?? localized?.summary ?? fApp.description ?? localized?.description ?? ""
+                    let appIcon = fApp.icon ?? localized?.icon
+                    let iconURL = appIcon.flatMap { Self.trustedURL("icons/\($0)", relativeTo: baseDirectory)?.absoluteString } ?? ""
+                    apps.append(SourceApp(name: appName, bundleIdentifier: fApp.packageName, version: latest.version,
+                                          downloadURL: latest.downloadURL, iconURL: iconURL,
+                                          localizedDescription: appSummary, categories: fApp.categories ?? [],
+                                          sizeBytes: latest.sizeBytes, sha256: latest.sha256, minimumSDK: latest.minimumSDK,
+                                          targetSDK: latest.targetSDK, architectures: latest.architectures,
+                                          artifact: latest.artifact, versions: versions))
                 }
-                apps.sort { $0.name.lowercased() < $1.name.lowercased() }
-                let source = AppSource(name: fdroid.repo.name, identifier: urlString, apps: apps)
-                upsert(source: source)
-            }
-            // Fallback: Husk simple format
-            else if let simple = try? JSONDecoder().decode(HuskSimpleSource.self, from: data) {
-                let apps = simple.apps.map {
-                    SourceApp(name: $0.name, bundleIdentifier: $0.bundleIdentifier,
-                              version: $0.version, downloadURL: $0.downloadURL,
-                              iconURL: $0.iconURL, localizedDescription: $0.localizedDescription,
-                              categories: $0.categories ?? [], sizeBytes: $0.sizeBytes ?? 0,
-                              sha256: $0.sha256, minimumSDK: $0.minimumSDK,
-                              targetSDK: $0.targetSDK, architectures: $0.architectures ?? [],
-                              artifact: SourceArtifact.resolve($0.downloadFormat, url: $0.downloadURL))
+                apps.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                upsert(source: AppSource(name: fdroid.repo.name, identifier: urlString, apps: apps))
+            } else if let simple = try? JSONDecoder().decode(HuskSimpleSource.self, from: data) {
+                guard !simple.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      simple.apps.count <= 100_000 else { throw RepositoryError.invalidIndex }
+                var apps: [SourceApp] = []
+                var seen = Set<String>()
+                for entry in simple.apps {
+                    guard Self.validPackageName(entry.bundleIdentifier), seen.insert(entry.bundleIdentifier).inserted,
+                          !entry.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                          entry.iconURL.isEmpty || Self.trustedURL(entry.iconURL) != nil,
+                          let latest = Self.sourceVersion(version: entry.version, downloadURL: entry.downloadURL,
+                                                         sizeBytes: entry.sizeBytes, sha256: entry.sha256,
+                                                         minimumSDK: entry.minimumSDK, targetSDK: entry.targetSDK,
+                                                         architectures: entry.architectures, downloadFormat: entry.downloadFormat) else {
+                        rejected += 1
+                        continue
+                    }
+                    var versions = [latest]
+                    var seenVersionURLs = Set([latest.downloadURL])
+                    for rawVersion in (entry.versions ?? []).prefix(1_000) {
+                        guard let version = Self.sourceVersion(version: rawVersion.version, downloadURL: rawVersion.downloadURL,
+                                                               sizeBytes: rawVersion.sizeBytes, sha256: rawVersion.sha256,
+                                                               minimumSDK: rawVersion.minimumSDK, targetSDK: rawVersion.targetSDK,
+                                                               architectures: rawVersion.architectures, downloadFormat: rawVersion.downloadFormat) else {
+                            rejected += 1
+                            continue
+                        }
+                        if seenVersionURLs.insert(version.downloadURL).inserted { versions.append(version) }
+                    }
+                    apps.append(SourceApp(name: entry.name, bundleIdentifier: entry.bundleIdentifier, version: latest.version,
+                                          downloadURL: latest.downloadURL, iconURL: entry.iconURL,
+                                          localizedDescription: entry.localizedDescription, categories: entry.categories ?? [],
+                                          sizeBytes: latest.sizeBytes, sha256: latest.sha256,
+                                          minimumSDK: latest.minimumSDK, targetSDK: latest.targetSDK,
+                                          architectures: latest.architectures, artifact: latest.artifact, versions: versions))
                 }
-                let source = AppSource(name: simple.name, identifier: urlString, apps: apps)
-                upsert(source: source)
+                upsert(source: AppSource(name: simple.name, identifier: urlString, apps: apps))
             } else {
-                fetchErrors[urlString] = "Unrecognized source format"
-                HuskLog.log("sources", "Unrecognized format at \(urlString)")
+                throw RepositoryError.invalidIndex
+            }
+
+            if rejected > 0 {
+                fetchErrors[urlString] = "Skipped \(rejected) entries with duplicate IDs or invalid metadata."
             }
         } catch {
             fetchErrors[urlString] = error.localizedDescription
@@ -235,10 +421,11 @@ final class SourceManager: ObservableObject {
 
     // MARK: - Repository Download
 
-    func download(app: SourceApp) {
-        let safeVersion = app.version.replacingOccurrences(of: "[^A-Za-z0-9._-]", with: "_", options: .regularExpression)
-        let filename = "\(app.bundleIdentifier)-\(safeVersion.isEmpty ? "latest" : safeVersion).\(app.artifact.rawValue)"
-        Downloads.shared.addRepositoryArtifact(title: app.name, urlString: app.downloadURL, filename: filename,
-                                               size: app.sizeBytes, sha256: app.sha256, kind: app.artifact.downloadKind)
+    func download(app: SourceApp, version: SourceVersion? = nil) {
+        let selected = version ?? app.latestVersion
+        let safeVersion = selected.version.replacingOccurrences(of: "[^A-Za-z0-9._-]", with: "_", options: .regularExpression)
+        let filename = "\(app.bundleIdentifier)-\(safeVersion.isEmpty ? "latest" : safeVersion).\(selected.artifact.rawValue)"
+        Downloads.shared.addRepositoryArtifact(title: "\(app.name) \(selected.version)", urlString: selected.downloadURL, filename: filename,
+                                               size: selected.sizeBytes, sha256: selected.sha256, kind: selected.artifact.downloadKind)
     }
 }

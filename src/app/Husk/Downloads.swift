@@ -8,27 +8,6 @@ import UIKit
 import ActivityKit
 #endif
 
-private struct DownloadContentRange {
-    let total: Int64
-    let bodyLength: Int64
-}
-
-private func downloadContentRange(_ value: String?, _ offset: Int64) -> DownloadContentRange? {
-    guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-          value.lowercased().hasPrefix("bytes ") else { return nil }
-    let rangeAndTotal = value.dropFirst(6).split(separator: "/", maxSplits: 1)
-    guard rangeAndTotal.count == 2,
-          let total = Int64(String(rangeAndTotal[1])), total > 0 else { return nil }
-    let bounds = rangeAndTotal[0].split(separator: "-", maxSplits: 1)
-    guard bounds.count == 2,
-          let start = Int64(String(bounds[0])), let end = Int64(String(bounds[1])),
-          start >= 0, start == offset, end >= start, end < total else { return nil }
-    let (difference, differenceOverflow) = end.subtractingReportingOverflow(start)
-    let (bodyLength, lengthOverflow) = difference.addingReportingOverflow(1)
-    guard !differenceOverflow, !lengthOverflow else { return nil }
-    return DownloadContentRange(total: total, bodyLength: bodyLength)
-}
-
 /// Downloads from a link: one file, or a whole folder served from a computer (tools/serve-folder.py).
 ///
 /// Every file is written into a `.part` beside where it goes and continued with a Range request from what is already on disk, so
@@ -449,7 +428,7 @@ final class Downloads: ObservableObject {
     }
 
     /// One file's transfer ended: complete, or stopped part-way (its bytes stay in the .part for next time).
-    fileprivate func ended(_ tag: TaskTag, error: String?, cancelled: Bool = false, background: Bool = false, expectedSize: Int64? = nil) {
+    fileprivate func ended(_ tag: TaskTag, error: String?, cancelled: Bool = false, background: Bool = false, expectedSize: Int64? = nil, rangeTotalUnknown: Bool = false) {
         let k = key(tag.job, tag.path)
         if background { handedOff.remove(k) } else { directRunning[k] = nil }
         guard let j = jobs.firstIndex(where: { $0.id == tag.job }), let i = jobs[j].files.firstIndex(where: { $0.path == tag.path }) else { pump(); return }
@@ -473,7 +452,7 @@ final class Downloads: ObservableObject {
             pump()
             return
         }
-        if transferError == nil, !cancelled, f.size == 0 || have == f.size {
+        if transferError == nil, !cancelled, (f.size == 0 || have == f.size), !(rangeTotalUnknown && declaredSize == 0) {
             if let expected = f.sha256 {
                 guard let actual = Self.sha256(part) else {
                     try? FileManager.default.removeItem(at: part)
@@ -509,6 +488,11 @@ final class Downloads: ObservableObject {
             } catch {
                 jobs[j].files[i].error = error.localizedDescription
             }
+        } else if rangeTotalUnknown, transferError == nil, !cancelled, !jobs[j].paused {
+            // A complete 206 body with Content-Range total `*` is not proof it reached EOF. Ask for the next byte range;
+            // a 416 with bytes */N confirms the final size without accepting a partial response as a finished file.
+            retries[k] = nil
+            HuskLog.log("downloads", "\(f.path): range total is unknown at \(Self.bytes(have)); checking for more bytes")
         } else if !cancelled, !jobs[j].paused {
             // Stopped early (a dropped connection, the server went away, the background service gave up): again from where it is,
             // after a pause that grows, a few times; then it waits for Retry.
@@ -731,6 +715,7 @@ final class DirectDownloadDelegate: NSObject, URLSessionDataDelegate {
         var written: Int64
         var expected: Int64 = 0
         var expectedRangeLength: Int64?
+        var rangeTotalUnknown = false
         var lastReport = Date.distantPast
         var error: String?
         init(tag: TaskTag, part: URL, offset: Int64) { self.tag = tag; self.part = part; written = offset }
@@ -758,18 +743,27 @@ final class DirectDownloadDelegate: NSObject, URLSessionDataDelegate {
                 completionHandler(.cancel)
                 return
             }
-            // The rest, from where the .part ends. A numeric total is needed to tell when all bytes arrived.
             try? h.truncate(atOffset: UInt64(t.tag.offset))
             t.written = t.tag.offset
-            t.expected = range.total
+            t.expected = range.total ?? 0
             t.expectedRangeLength = range.bodyLength
+            t.rangeTotalUnknown = range.total == nil
         case 200:
             // The whole file (no Range asked, or the server ignores it): from the start.
             try? h.truncate(atOffset: 0)
             t.written = 0
             t.expected = max(0, http.expectedContentLength)
         case 416:
-            // A stale offset must not make an unknown-length, partial file look complete. Drop it and retry from byte zero.
+            let total = downloadUnsatisfiedRangeTotal(http.value(forHTTPHeaderField: "Content-Range"))
+            if let total, total == t.tag.offset, Downloads.size(t.part) == total {
+                // A completed local part is confirmed by the server's unsatisfied-range total.
+                t.written = total
+                t.expected = total
+                t.expectedRangeLength = 0
+                try? h.close()
+                completionHandler(.allow)
+                return
+            }
             t.error = "the server rejected the resume request"
             try? h.close()
             try? fm.removeItem(at: t.part)
@@ -814,9 +808,10 @@ final class DirectDownloadDelegate: NSObject, URLSessionDataDelegate {
         let incomplete = t.expected > 0 && t.written < t.expected
         let tag = t.tag
         let expectedSize = t.expected > 0 ? t.expected : nil
+        let rangeTotalUnknown = t.rangeTotalUnknown && message == nil && !cancelled
         Task { @MainActor in
             Downloads.shared.ended(tag, error: message ?? (incomplete && !cancelled ? "the connection ended early" : nil),
-                                   cancelled: cancelled, expectedSize: expectedSize)
+                                   cancelled: cancelled, expectedSize: expectedSize, rangeTotalUnknown: rangeTotalUnknown)
         }
     }
 }
@@ -849,12 +844,19 @@ final class BackgroundDownloadDelegate: NSObject, URLSessionDownloadDelegate {
         let range = status == 206 ? downloadContentRange(response?.value(forHTTPHeaderField: "Content-Range"), tag.offset) : nil
         let fm = FileManager.default
         var rangeBodyIncomplete = false
+        if status == 416 {
+            let total = downloadUnsatisfiedRangeTotal(response?.value(forHTTPHeaderField: "Content-Range"))
+            if let total, total == tag.offset, fm.fileExists(atPath: part.path), Downloads.size(part) == total {
+                Task { @MainActor in Downloads.shared.ended(tag, error: nil, background: true, expectedSize: total) }
+                return
+            }
+            try? fm.removeItem(at: part)
+            let message = "the server rejected the resume request"
+            Task { @MainActor in Downloads.shared.ended(tag, error: message, background: true) }
+            return
+        }
         do {
             try fm.createDirectory(at: part.deletingLastPathComponent(), withIntermediateDirectories: true)
-            if status == 416 {
-                try? fm.removeItem(at: part)
-                throw NSError(domain: "HuskDownloads", code: status, userInfo: [NSLocalizedDescriptionKey: "the server rejected the resume request"])
-            }
             if status == 206 {
                 guard let range else {
                     try? fm.removeItem(at: part)
@@ -887,7 +889,8 @@ final class BackgroundDownloadDelegate: NSObject, URLSessionDownloadDelegate {
             return
         }
         let message = rangeBodyIncomplete ? "the response body did not match its byte range" : nil
-        Task { @MainActor in Downloads.shared.ended(tag, error: message, background: true, expectedSize: range?.total) }
+        let rangeTotalUnknown = status == 206 && range?.total == nil && !rangeBodyIncomplete
+        Task { @MainActor in Downloads.shared.ended(tag, error: message, background: true, expectedSize: range?.total, rangeTotalUnknown: rangeTotalUnknown) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
@@ -896,7 +899,13 @@ final class BackgroundDownloadDelegate: NSObject, URLSessionDownloadDelegate {
         let cancelled = ns.code == NSURLErrorCancelled
         let response = task.response as? HTTPURLResponse
         let expectedSize = response.flatMap {
-            $0.statusCode == 206 ? downloadContentRange($0.value(forHTTPHeaderField: "Content-Range"), tag.offset)?.total : nil
+            if $0.statusCode == 206 {
+                return downloadContentRange($0.value(forHTTPHeaderField: "Content-Range"), tag.offset)?.total
+            }
+            if $0.statusCode == 416 {
+                return downloadUnsatisfiedRangeTotal($0.value(forHTTPHeaderField: "Content-Range"))
+            }
+            return nil
         }
         // The bytes it had are lost with it (they are in iOS's own file, not the .part); the next try starts where the .part ends.
         let message = error.localizedDescription

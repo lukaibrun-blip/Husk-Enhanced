@@ -327,15 +327,26 @@ private struct SourceAppDetailSheet: View {
     @ObservedObject private var sources = SourceManager.shared
     @ObservedObject private var downloads = Downloads.shared
     @ObservedObject private var library = TranslationLayerStore.shared
+    @State private var selectedVersionURL: String?
 
-    private var job: Downloads.Job? { downloads.jobs.first { $0.source == app.downloadURL && $0.kind == app.artifact.downloadKind } }
+    init(app: SourceApp) {
+        self.app = app
+        _selectedVersionURL = State(initialValue: app.latestVersion.downloadURL)
+    }
+
+    private var selectedVersion: SourceVersion {
+        app.versionOptions.first { $0.id == selectedVersionURL } ?? app.latestVersion
+    }
+    private var job: Downloads.Job? {
+        downloads.jobs.first { $0.source == selectedVersion.downloadURL && $0.kind == selectedVersion.artifact.downloadKind }
+    }
     private var inLibrary: Bool { library.apps.contains { $0.packageName == app.bundleIdentifier } }
     private var repository: String {
         sources.sources.first { source in source.apps.contains { $0.downloadURL == app.downloadURL } }?.name ?? "Repository"
     }
     private var compatibility: String {
-        let sdk = app.minimumSDK.map { "Android API \($0)+" } ?? "minimum Android version not declared"
-        let abi = app.architectures.isEmpty ? "native ABI not declared" : app.architectures.joined(separator: ", ")
+        let sdk = selectedVersion.minimumSDK.map { "Android API \($0)+" } ?? "minimum Android version not declared"
+        let abi = selectedVersion.architectures.isEmpty ? "native ABI not declared" : selectedVersion.architectures.joined(separator: ", ")
         return "\(sdk) · \(abi)"
     }
 
@@ -360,18 +371,28 @@ private struct SourceAppDetailSheet: View {
                         Text(app.localizedDescription).font(.body).fixedSize(horizontal: false, vertical: true)
                     }
 
+                    if app.versionOptions.count > 1 {
+                        Picker("Available version", selection: $selectedVersionURL) {
+                            ForEach(app.versionOptions) { version in
+                                Text(version.version).tag(Optional(version.id))
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    }
+
                     VStack(spacing: 10) {
                         metadata("Repository", repository)
-                        metadata("Version", app.version)
-                        if app.sizeBytes > 0 { metadata("Download size", Downloads.bytes(app.sizeBytes)) }
+                        metadata("Version", selectedVersion.version)
+                        if selectedVersion.sizeBytes > 0 { metadata("Download size", Downloads.bytes(selectedVersion.sizeBytes)) }
+                        metadata("Artifact", selectedVersion.artifact.rawValue.uppercased())
                         metadata("Declared compatibility", compatibility)
-                        if let target = app.targetSDK { metadata("Target Android API", String(target)) }
+                        if let target = selectedVersion.targetSDK { metadata("Target Android API", String(target)) }
                         if !app.categories.isEmpty { metadata("Categories", app.categories.joined(separator: ", ")) }
                     }
                     .padding(14)
                     .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-                    if app.sha256 != nil {
+                    if selectedVersion.sha256 != nil {
                         Label("The repository publishes a SHA-256 checksum; Husk verifies it before adding the download to your library.", systemImage: "checkmark.shield.fill")
                             .font(.footnote).foregroundStyle(.green)
                     } else {
@@ -381,6 +402,10 @@ private struct SourceAppDetailSheet: View {
                     Text("Compatibility is limited to the Android version and native ABIs declared by the repository. Husk cannot confirm that this app runs on this device until it is tried.")
                         .font(.footnote).foregroundStyle(.secondary)
 
+                    if inLibrary {
+                        Label("Already in Husk’s library; downloading another version adds it as an update.", systemImage: "checkmark.circle.fill")
+                            .font(.footnote).foregroundStyle(.green)
+                    }
                     if let problem = downloads.problem {
                         Text(problem).font(.footnote).foregroundStyle(.orange)
                     }
@@ -429,12 +454,9 @@ private struct SourceAppDetailSheet: View {
                                 Button("Cancel", role: .destructive) { downloads.remove(job.id) }
                             }
                         }
-                    } else if inLibrary {
-                        Label("Added to Husk’s library", systemImage: "checkmark.circle.fill")
-                            .font(.headline).foregroundStyle(.green)
                     } else {
-                        Button { sources.download(app: app) } label: {
-                            Label("Download \(app.artifact.rawValue.uppercased())", systemImage: "arrow.down.circle.fill")
+                        Button { sources.download(app: app, version: selectedVersion) } label: {
+                            Label("Download \(selectedVersion.artifact.rawValue.uppercased())", systemImage: "arrow.down.circle.fill")
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)

@@ -37,6 +37,8 @@ struct ContentView: View {
     @ObservedObject private var massTest = MassTest.shared
     @ObservedObject private var updates = AppUpdates.shared
     @State private var showWhatsNew = false
+    @State private var brandingChoice = UserDefaults.standard.string(forKey: "husk.branding.choice") ?? "ask"
+    @State private var showBranding = UserDefaults.standard.string(forKey: "husk.branding.choice") != "disabled"
     @AppStorage(Holiday.key) private var holiday = true
 
     var body: some View {
@@ -116,6 +118,16 @@ struct ContentView: View {
                     }
             }
 
+            if showBranding {
+                BrandingSplash(isFirstLaunch: brandingChoice == "ask", onChoose: { enabled in
+                    brandingChoice = enabled ? "always" : "disabled"
+                    UserDefaults.standard.set(brandingChoice, forKey: "husk.branding.choice")
+                    withAnimation(.easeInOut(duration: 0.25)) { showBranding = false }
+                })
+                .transition(.opacity)
+                .zIndex(30)
+            }
+
             if confirmAndroid {
                 ZStack {
                     Color.black.opacity(0.55).ignoresSafeArea()
@@ -133,9 +145,13 @@ struct ContentView: View {
         // window rather than with .preferredColorScheme — see Theme.apply.
         .onAppear { Theme.apply(appearance) }
         .onChange(of: appearance) { Theme.apply($0) }
+        .onChange(of: showBranding) { visible in if !visible { evaluate() } }
         .animation(.snappy(duration: 0.22), value: showGuestScreen)
         .animation(.snappy(duration: 0.25), value: host.toast)
-        .fullScreenCover(isPresented: $showOnboarding) {
+        .fullScreenCover(isPresented: Binding(
+            get: { showOnboarding && !showBranding },
+            set: { showOnboarding = $0 }
+        )) {
             OnboardingView {
                 showOnboarding = false
                 if Onboarding.autoStart, JITBootstrap.ready {
@@ -254,6 +270,7 @@ struct ContentView: View {
     }
 
     private func evaluate() {
+        guard !showBranding else { return }
         // Before anything else wants JIT: the setting that turns it on as Husk opens.
         jit.enableAtLaunchIfAsked()
         try? guest.prepareFirmware()
@@ -768,4 +785,50 @@ enum AutoStart {
     }
 
     static func end() { try? FileManager.default.removeItem(atPath: marker) }
+}
+
+
+
+/// A first-launch choice, then an optional branded screen on every later launch.
+private struct BrandingSplash: View {
+    let isFirstLaunch: Bool
+    let onChoose: (Bool) -> Void
+
+    var body: some View {
+        ZStack {
+            Theme.bg.ignoresSafeArea()
+            VStack(spacing: 18) {
+                Spacer()
+                HuskMark(size: 92)
+                    .shadow(color: Theme.accent.opacity(0.3), radius: 24, y: 8)
+                Text("HUSK ENHANCED")
+                    .font(.system(size: 21, weight: .semibold))
+                    .tracking(4)
+                    .foregroundStyle(Theme.text)
+                Text("Modified by Lukai")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(Theme.textDim)
+                Spacer()
+                VStack(spacing: 10) {
+                    Button(isFirstLaunch ? "Always Show" : "Continue") { onChoose(true) }
+                        .buttonStyle(.borderedProminent)
+                        .buttonBorderShape(.capsule)
+                        .frame(maxWidth: .infinity)
+                    Button(isFirstLaunch ? "Disable" : "Disable Permanently", role: .cancel) { onChoose(false) }
+                        .buttonStyle(.bordered)
+                        .buttonBorderShape(.capsule)
+                        .frame(maxWidth: .infinity)
+                }
+                .padding(.horizontal, 28)
+                Text(isFirstLaunch ? "Choose whether to show this screen each time Husk opens." : "This screen is shown because you chose Always Show.")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.textDim)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+                    .padding(.bottom, 20)
+            }
+            .padding(.top, 20)
+        }
+        .accessibilityElement(children: .contain)
+    }
 }

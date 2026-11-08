@@ -34,9 +34,9 @@ struct StoreView: View {
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button { showAPKStore = true } label: {
-                        Image(systemName: "shippingbox")
+                        Label("APK Store", systemImage: "shippingbox")
                     }
-                    .accessibilityLabel("Browse APK repositories")
+                    .accessibilityLabel("Browse APK Store repositories")
                     if !manager.downloadProgress.isEmpty {
                         Button { Router.shared.showDownloads = true } label: {
                             Label("\(manager.downloadProgress.count) Downloading", systemImage: "arrow.down.circle")

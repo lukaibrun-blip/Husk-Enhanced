@@ -319,3 +319,28 @@ targets:
         CODE_SIGN_STYLE: Automatic
         OTHER_LDFLAGS: ["$(inherited)", "-weak_framework", "ActivityKit"]
         TARGETED_DEVICE_FAMILY: "1"
+
+
+
+  HuskDownloadRangeTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: HuskTests
+      - path: Husk/DownloadRange.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.husk.downloadrangetests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.0"
+
+schemes:
+  HuskDownloadRangeTests:
+    build:
+      targets:
+        HuskDownloadRangeTests: all
+    test:
+      targets:
+        - HuskDownloadRangeTests

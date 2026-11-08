@@ -60,6 +60,13 @@ else
     step "optional PS4 layer omitted (separate Bachata-S4 and FEXCore checkouts not present)"
 fi
 
+step "download range unit tests"
+(cd "$HUSK_ROOT/src/app" && xcodegen generate --quiet)
+xcodebuild -project "$HUSK_ROOT/src/app/Husk.xcodeproj" \
+    -scheme HuskDownloadRangeTests -destination 'platform=macOS' \
+    -derivedDataPath "${TEST_DERIVED_DATA:-${RUNNER_TEMP:-/tmp}/husk-range-tests}" \
+    CODE_SIGNING_ALLOWED=NO test
+
 step "app + IPA"
 mkdir -p "$(dirname "$OUT")"
 ./scripts/package_ipa.sh "$OUT"
