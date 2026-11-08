@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "husk-tl-bionic.h"
 #include "husk-tl-internal.h"
 #include "husk-tl-ld.h"
 
