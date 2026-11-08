@@ -1,4 +1,4 @@
-name: Build iOS IPA
+name: Build Husk Enhanced IPA
 
 on:
   push:
@@ -12,13 +12,19 @@ permissions:
 
 jobs:
   build-ipa:
-    # The build scripts use Homebrew's Apple Silicon prefix (/opt/homebrew).
-    runs-on: macos-15
+    # StikJIT's checked-in XCFramework was built with Swift 6.4 (Xcode 27).
+    runs-on: xcode-27
     timeout-minutes: 360
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Verify Xcode and Swift toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          swift --version | grep -F "Swift version 6.4"
 
       - name: Install build tools
         run: brew install autoconf automake cmake libtool meson ninja pkg-config qemu xcodegen
@@ -37,13 +43,13 @@ jobs:
       - name: Build and package SideStore IPA
         env:
           DD: ${{ runner.temp }}/husk-derived-data
-        run: ./scripts/ci_build.sh "$RUNNER_TEMP/Husk.ipa"
+        run: ./scripts/ci_build.sh "$RUNNER_TEMP/Husk-Enhanced.ipa"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Husk-SideStore-IPA
-          path: ${{ runner.temp }}/Husk.ipa
+          name: Husk-Enhanced-SideStore-IPA
+          path: ${{ runner.temp }}/Husk-Enhanced.ipa
           if-no-files-found: error
           retention-days: 14
 
@@ -51,7 +57,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Husk-iOS-build-logs
+          name: Husk-Enhanced-iOS-build-logs
           path: |
             build/logs/**/*.log
             ${{ runner.temp }}/husk-derived-data/build.log

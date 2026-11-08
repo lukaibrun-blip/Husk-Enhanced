@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="src/app/Husk/Assets.xcassets/AppIcon.appiconset/Icon-Default.png" width="120" height="120" alt="Husk">
+  <img src="src/app/Husk/Assets.xcassets/AppIcon.appiconset/Icon-Default.png" width="120" height="120" alt="Husk Enhanced">
 </p>
 
-<h1 align="center">Husk</h1>
+<h1 align="center">Husk Enhanced</h1>
 
 <p align="center">Android apps and games on your iPhone.</p>
 

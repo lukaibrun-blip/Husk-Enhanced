@@ -276,10 +276,11 @@ struct HomeView: View {
 
     private var topBar: some View {
         HStack(spacing: 10) {
-            Text("Husk")
-                .font(.system(size: 30, weight: .bold, design: .rounded))
+            Text("Husk Enhanced")
+                .font(.system(size: 26, weight: .bold, design: .rounded))
                 .foregroundStyle(Console.text)
-                .fixedSize()
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
             if holiday && Holiday.inSeason { ChristmasTree(size: 22) }
             Spacer(minLength: 4)
             Button { router.addSomething() } label: {

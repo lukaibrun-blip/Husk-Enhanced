@@ -57,11 +57,11 @@ struct BootScreen: View {
                                value: pulse)
                     .onAppear { pulse = true }
 
-                Text("HUSK")
+                Text("HUSK ENHANCED")
                     .font(.system(size: 22, weight: .semibold))
-                    .tracking(9)
+                    .tracking(5)
                     .foregroundStyle(Theme.text)
-                    .padding(.leading, 9)
+                    .padding(.leading, 5)
                     .padding(.top, 18)
 
                 // The line that talks. Keyed on the index so each one fades
