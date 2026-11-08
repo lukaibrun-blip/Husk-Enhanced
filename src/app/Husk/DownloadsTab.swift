@@ -49,7 +49,7 @@ struct DownloadsTab: View {
                     HStack {
                         Text("Downloads")
                         Spacer()
-                        if downloads.jobs.contains(where: \.complete) {
+                        if downloads.jobs.contains(where: { $0.complete && $0.ingestion != .adding }) {
                             Button("Clear Finished") { downloads.clearFinished() }.font(.caption).textCase(nil)
                         }
                     }
@@ -104,7 +104,16 @@ private struct DownloadRow: View {
     private var fraction: Double { job.total > 0 ? min(1, Double(job.received) / Double(job.total)) : 0 }
 
     private var status: String {
-        if job.complete { return job.kind == .apk ? "Added to the library" : job.kind == .folder ? "In Shared Storage" : "In Shared Storage" }
+        if job.complete {
+            guard job.isLibraryArtifact else { return "In Shared Storage" }
+            switch job.ingestion {
+            case .adding: return "Adding to the library…"
+            case .added: return "Added to the library"
+            case .failed: return "Ingestion failed: \(job.ingestionError ?? "Unknown error")"
+            case .interrupted: return job.ingestionError ?? "Ingestion interrupted; check the library."
+            case nil: return "Downloaded"
+            }
+        }
         if job.paused { return "Paused · \(Downloads.bytes(job.received)) of \(Downloads.bytes(job.total))" }
         if let err = job.files.first(where: { $0.error != nil })?.error { return "Stopped: \(err)" }
         var s = "\(Downloads.bytes(job.received)) of \(Downloads.bytes(job.total))"
@@ -123,8 +132,8 @@ private struct DownloadRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
-                Image(systemName: job.kind == .folder ? "folder.fill" : job.kind == .apk ? "app.badge.fill" : "doc.fill")
-                    .foregroundStyle(job.complete ? Color.green : Color.accentColor)
+                Image(systemName: job.kind == .folder ? "folder.fill" : job.kind == .apk || job.kind == .bundle ? "app.badge.fill" : "doc.fill")
+                    .foregroundStyle(job.complete && (!job.isLibraryArtifact || job.ingestion == .added) ? Color.green : Color.accentColor)
                 Text(job.title).font(.headline).lineLimit(1)
                 Spacer()
                 if !job.complete {
@@ -139,10 +148,16 @@ private struct DownloadRow: View {
                     }
                     .buttonStyle(.borderless)
                     .accessibilityLabel("Cancel Download")
+                } else if job.ingestion == .failed || job.ingestion == .interrupted {
+                    Button("Retry") { Downloads.shared.retryIngestion(job.id) }
+                        .buttonStyle(.borderless)
                 }
             }
             if !job.complete { ProgressView(value: fraction) }
-            Text(status).font(.caption).foregroundStyle(job.failed ? Color.orange : Color.secondary).lineLimit(2)
+            else if job.ingestion == .adding { ProgressView() }
+            Text(status).font(.caption)
+                .foregroundStyle(job.failed || job.ingestion == .failed || job.ingestion == .interrupted ? Color.orange : Color.secondary)
+                .lineLimit(2)
         }
         .padding(.vertical, 4)
     }

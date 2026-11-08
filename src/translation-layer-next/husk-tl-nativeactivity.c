@@ -236,6 +236,7 @@ bool tl_na_start(const tl_ga_config *cfg)
     tl_set_data_dir(cfg->data_dir);
     tl_nwindow_configure(cfg->width, cfg->height, cfg->metal_layer);
     int n = tl_dexidx_open(cfg->apk_path);
+    if (n < 0) { tl_log_line("ue4: could not safely index the APK's DEX"); return false; }
     tl_log_line("ue4: %d classes in the APK's DEX", n);
     if (!tl_ld_add_apk(cfg->apk_path)) return false;
     N.generic = !tl_ld_has_lib("libUE4.so");

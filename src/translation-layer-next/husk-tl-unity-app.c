@@ -69,7 +69,7 @@ static struct {
     atomic_int state;
     int engine;
     char apk[1024], data[1024], package[160], angle[1024], ca[1024], vulkan[1024];
-    char extra[15][1024];
+    char extra[TL_LD_MAX_APKS - 1][1024];
     int nextra;
     void *layer;
     int width, height;
@@ -309,7 +309,7 @@ static void *launch_thread(void *arg)
     } else if (A.engine == ENGINE_SDL) {
         tl_ga_config cfg = {
             .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
-            .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
+            .metal_layer = A.layer, .angle_egl = A.angle[0] ? A.angle : NULL, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
         };
         char activity[260];
         if (!manifest_launcher_activity(A.apk, A.package, activity, sizeof(activity))) {
@@ -448,7 +448,7 @@ static bool launch(int engine, const char *apk, const char *data_dir, void *meta
                    const char *angle_dylib, const char *ca_bundle)
 {
     int expected = HUSK_UNITY_IDLE;
-    if (!apk || !data_dir || !metal_layer || width <= 0 || height <= 0 || !angle_dylib) return false;
+    if (!apk || !data_dir || !metal_layer || width <= 0 || height <= 0 || (!angle_dylib && engine != ENGINE_SDL)) return false;
     int st = atomic_load(&A.state);
     if (st == HUSK_UNITY_STARTING) return false;
     if (st != HUSK_UNITY_IDLE) {
@@ -463,7 +463,7 @@ static bool launch(int engine, const char *apk, const char *data_dir, void *meta
     A.engine = engine;
     snprintf(A.apk, sizeof(A.apk), "%s", apk);
     snprintf(A.data, sizeof(A.data), "%s", data_dir);
-    snprintf(A.angle, sizeof(A.angle), "%s", angle_dylib);
+    snprintf(A.angle, sizeof(A.angle), "%s", angle_dylib ? angle_dylib : "");
     snprintf(A.ca, sizeof(A.ca), "%s", ca_bundle ? ca_bundle : "");
     A.layer = metal_layer; A.width = width; A.height = height;
     if (!husk_unity_package_name(apk, A.package, sizeof(A.package))) snprintf(A.package, sizeof(A.package), "%s", engine == ENGINE_GAMEACTIVITY ? "com.mojang.minecraftpe" : engine == ENGINE_GTA ? "com.rockstargames.gtasa" : engine == ENGINE_UE4 ? "com.epicgames.ue4" : engine == ENGINE_SDL ? "com.sdl.game" : engine == ENGINE_COCOS ? "com.cocos.game" : engine == ENGINE_GODOT ? "com.godot.game" : engine == ENGINE_FLUTTER ? "com.flutter.app" : engine == ENGINE_GAMEMAKER ? "com.company.game" : engine == ENGINE_JAVA ? "com.java.app" : "com.unity.game");
@@ -597,10 +597,18 @@ void husk_native_set_shared_storage(const char *dir) { tl_set_shared_storage(dir
 
 void husk_native_add_package(const char *apk)
 {
-    if (apk && A.nextra < 15 && atomic_load(&A.state) == HUSK_UNITY_IDLE) {
-        snprintf(A.extra[A.nextra++], sizeof(A.extra[0]), "%s", apk);
-        tl_ld_queue_split(apk);
+    if (!apk || !apk[0] || atomic_load(&A.state) != HUSK_UNITY_IDLE) return;
+    if (strlen(apk) >= sizeof(A.extra[0])) {
+        tl_log_line("native: split path is too long; ignoring it");
+        return;
     }
+    if (A.nextra >= TL_LD_MAX_APKS - 1) {
+        tl_log_line("native: split limit (%d additional APKs) reached; ignoring %s", TL_LD_MAX_APKS - 1, apk);
+        return;
+    }
+    snprintf(A.extra[A.nextra], sizeof(A.extra[0]), "%s", apk);
+    tl_ld_queue_split(A.extra[A.nextra]);
+    A.nextra++;
 }
 void husk_sdl_set_safe_insets(int left, int top, int right, int bottom) { tl_sdl_set_safe_insets(left, top, right, bottom); }
 int husk_sdl_apk_is_portrait(const char *apk) { return tl_sdl_manifest_portrait(apk) ? 1 : 0; }

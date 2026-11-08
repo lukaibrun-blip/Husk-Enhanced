@@ -19,6 +19,19 @@ struct TLAppSettings: Codable, Equatable {
         }
     }
 
+    /// Which graphics API the game uses when its engine supports more than one backend.
+    enum Renderer: String, Codable, CaseIterable, Identifiable {
+        case automatic, openGLES, vulkan
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .automatic: return "Automatic (Recommended)"
+            case .openGLES: return "OpenGL ES (ANGLE)"
+            case .vulkan: return "Vulkan (MoltenVK)"
+            }
+        }
+    }
+
     /// How many pixels the game draws for each point of the screen. Fewer pixels run faster and take less memory.
     enum Resolution: String, Codable, CaseIterable, Identifiable {
         case low, medium, high, native
@@ -80,6 +93,7 @@ struct TLAppSettings: Codable, Equatable {
     var orientation: Orientation = .auto
     var window: WindowMode = .auto
     var resolution: Resolution = .high
+    var renderer: Renderer = .automatic
     /// The frames-per-second readout in the top bar.
     var showStats = true
     /// Start with nothing over the picture: no bar, no controller, no readout. Three fingers tapped together bring them back.
@@ -101,6 +115,7 @@ struct TLAppSettings: Codable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         orientation = try c.decodeIfPresent(Orientation.self, forKey: .orientation) ?? .auto
         resolution = try c.decodeIfPresent(Resolution.self, forKey: .resolution) ?? .high
+        renderer = try c.decodeIfPresent(Renderer.self, forKey: .renderer) ?? .automatic
         showStats = try c.decodeIfPresent(Bool.self, forKey: .showStats) ?? true
         cleanView = try c.decodeIfPresent(Bool.self, forKey: .cleanView) ?? false
         keepAwake = try c.decodeIfPresent(Bool.self, forKey: .keepAwake) ?? true
@@ -193,6 +208,20 @@ struct TLAppSettingsView: View {
             } footer: {
                 Text("\(settings.resolution.detail) Orientation and resolution apply the next time the game starts, and a game already "
                    + "running in this session needs Husk closed and opened again.")
+            }
+
+            Section {
+                if rendererOptions.count > 1 {
+                    Picker("Renderer", selection: rendererSelection) {
+                        ForEach(rendererOptions) { Text($0.title).tag($0) }
+                    }
+                } else {
+                    LabeledContent("Renderer", value: TLAppSettings.Renderer.automatic.title)
+                }
+            } header: {
+                Text("Graphics")
+            } footer: {
+                Text(rendererDescription + " Changes apply the next time the game starts.")
             }
 
             Section {
@@ -291,6 +320,51 @@ struct TLAppSettingsView: View {
             Button("Cancel", role: .cancel) { }
         } message: {
             Text("Saves, settings and caches the game made here are deleted.")
+        }
+    }
+
+    private var rendererOptions: [TLAppSettings.Renderer] {
+        let supported: [TLAppSettings.Renderer]
+        switch app.report?.nativeEngine {
+        case .sdl?, .ue4?: supported = TLAppSettings.Renderer.allCases
+        default: supported = [.automatic]
+        }
+        let moltenVK = (Bundle.main.privateFrameworksPath ?? "") + "/MoltenVK.framework/MoltenVK"
+        return supported.filter { $0 != .vulkan || FileManager.default.fileExists(atPath: moltenVK) }
+    }
+
+    private var rendererSelection: Binding<TLAppSettings.Renderer> {
+        Binding(
+            get: { rendererOptions.contains(settings.renderer) ? settings.renderer : .automatic },
+            set: { settings.renderer = $0 }
+        )
+    }
+
+    private var rendererDescription: String {
+        let selected = rendererOptions.contains(settings.renderer) ? settings.renderer : .automatic
+        switch app.report?.nativeEngine {
+        case .ue4?:
+            switch selected {
+            case .automatic:
+                return "Automatic uses Unreal's Vulkan renderer through MoltenVK when available; this is the recommended setting."
+            case .openGLES:
+                return "Forces OpenGL ES through ANGLE. Some Unreal games require Vulkan and may not start with this choice."
+            case .vulkan:
+                return "Forces Vulkan through MoltenVK."
+            }
+        case .sdl?:
+            switch selected {
+            case .automatic:
+                return rendererOptions.contains(.vulkan)
+                    ? "Automatic lets this SDL game choose; OpenGL ES (ANGLE) and Vulkan (MoltenVK) are available."
+                    : "Automatic uses OpenGL ES (ANGLE); MoltenVK is not available in this build."
+            case .openGLES:
+                return "Only OpenGL ES through ANGLE is available to the game."
+            case .vulkan:
+                return "Only Vulkan through MoltenVK is available to the game; the game must support Vulkan."
+            }
+        default:
+            return "This engine uses OpenGL ES through ANGLE. No alternate renderer is available for this engine in this build."
         }
     }
 

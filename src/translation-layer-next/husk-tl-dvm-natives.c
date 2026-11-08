@@ -849,7 +849,7 @@ NAT(Throwable_getStack)
 NAT(Runtime_freeMemory) { UNUSED; *ret = J(256ll << 20); return true; }
 NAT(Runtime_maxMemory) { UNUSED; *ret = J(512ll << 20); return true; }
 NAT(Runtime_gc) { UNUSED; return true; }
-NAT(Runtime_exit) { (void)self; (void)ret; tl_log_line("dvm: Runtime.exit(%d)", a[0].i); _exit(a[0].i); }
+NAT(Runtime_exit) { (void)self; (void)ret; tl_log_line("dvm: Runtime.exit(%d)", a[0].i); tl_bionic_guest_exit(a[0].i); }
 NAT(Runtime_nativeLoad)
 {
     (void)self;

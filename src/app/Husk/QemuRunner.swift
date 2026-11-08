@@ -1311,8 +1311,13 @@ final class QemuRunner: ObservableObject {
         let size = HuskGLView.pixelSize
         HuskGLView.surfaceReady.unlock()
 
-        guard let layer, size.width > 0 else {
-            HuskLog.log("gl", "no layer to probe with; staying on the software display")
+        guard let layer, size.width > 0, size.height > 0 else {
+            if QemuRunner.glProven {
+                UserDefaults.standard.removeObject(forKey: "husk.glProven")
+                HuskLog.log("gl", "no layer available; dropping cached GL proof and using software")
+            } else {
+                HuskLog.log("gl", "no layer to probe with; staying on the software display")
+            }
             return
         }
 
@@ -1327,8 +1332,12 @@ final class QemuRunner: ObservableObject {
                                              Int32(size.width), Int32(size.height))
         }
         if QemuRunner.glProven {
-            HuskLog.log("gl", "GL already proven on this device; context created "
-                            + "(create=\(created)), skipping the probe")
+            guard created else {
+                UserDefaults.standard.removeObject(forKey: "husk.glProven")
+                HuskLog.log("gl", "cached GL renderer failed to initialize; falling back to software")
+                return
+            }
+            HuskLog.log("gl", "GL already proven on this device; context created successfully, skipping the probe")
             return
         }
 

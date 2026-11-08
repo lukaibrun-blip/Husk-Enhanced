@@ -182,6 +182,14 @@ final class TranslationLayerStore: ObservableObject {
     @Published private(set) var checking = false
     @Published var lastError: String?
 
+    private struct PendingIngest {
+        let urls: [URL]
+        let move: Bool
+        let completion: (@MainActor (String?) -> Void)?
+    }
+    private var pendingIngests: [PendingIngest] = []
+    private var adoptDroppedAfterIngest = false
+
     private init() { reload() }
 
     /// Which reading of an app's libraries its report came from. A newer Husk that recognises more (an engine, a kind of game) reads
@@ -277,8 +285,16 @@ final class TranslationLayerStore: ObservableObject {
         return after.subtracting(before).first
     }
 
-    func add(_ urls: [URL], move: Bool = false) {
-        guard !urls.isEmpty, busy == nil else { return }
+    func add(_ urls: [URL], move: Bool = false, completion: (@MainActor (String?) -> Void)? = nil) {
+        guard !urls.isEmpty else { completion?(nil); return }
+        if busy != nil {
+            pendingIngests.append(PendingIngest(urls: urls, move: move, completion: completion))
+            return
+        }
+        startIngest(urls, move: move, completion: completion)
+    }
+
+    private func startIngest(_ urls: [URL], move: Bool, completion: (@MainActor (String?) -> Void)?) {
         busy = urls.count == 1 ? "Adding \(urls[0].lastPathComponent)…"
                                : "Adding \(urls.count) APKs…"
         Task.detached(priority: .userInitiated) {
@@ -287,9 +303,21 @@ final class TranslationLayerStore: ObservableObject {
                 self.busy = nil
                 self.lastError = failure
                 self.reload()
-                if failure == nil, move { self.adoptDroppedAPKs() }      // the next one waiting, if several were put there
+                completion?(failure)
+                if failure == nil, move { self.adoptDroppedAfterIngest = true }
+                self.startNextIngest()
+                if self.busy == nil, self.pendingIngests.isEmpty, self.adoptDroppedAfterIngest {
+                    self.adoptDroppedAfterIngest = false
+                    self.adoptDroppedAPKs()
+                }
             }
         }
+    }
+
+    private func startNextIngest() {
+        guard busy == nil, !pendingIngests.isEmpty else { return }
+        let next = pendingIngests.removeFirst()
+        startIngest(next.urls, move: next.move, completion: next.completion)
     }
 
     /// APKs put straight into Husk's folder (Files > On My iPhone > Husk, which the app shares) are taken in as apps, one each, and

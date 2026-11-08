@@ -75,7 +75,7 @@ static void vk_load(void)
     tl_log_line("vulkan: %s", V.gipa ? (V.have_path ? V.path : "MoltenVK linked into the process") : "MoltenVK not found");
 }
 static bool vk_ready(void) { pthread_once(&V.once, vk_load); return V.gipa != NULL; }
-bool tl_vk_available(void) { return V.have_path && vk_ready(); }
+bool tl_vk_available(void) { return !getenv("TL_SDL_NO_VULKAN") && V.have_path && vk_ready(); }
 
 /* MoltenVK's own list of instance extensions */
 static vk_ext_props *mvk_instance_exts(uint32_t *n)

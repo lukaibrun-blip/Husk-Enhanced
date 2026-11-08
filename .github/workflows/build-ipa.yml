@@ -1,0 +1,53 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches:
+      - main
+      - work/audit-bundle-dvm-android
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    # The build scripts use Homebrew's Apple Silicon prefix (/opt/homebrew).
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install autoconf automake cmake libtool meson ninja pkg-config qemu xcodegen
+
+      - name: Set up Rust for iOS
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Build and package SideStore IPA
+        env:
+          DD: ${{ runner.temp }}/husk-derived-data
+        run: ./scripts/ci_build.sh "$RUNNER_TEMP/Husk.ipa"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Husk-SideStore-IPA
+          path: ${{ runner.temp }}/Husk.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Husk-iOS-build-logs
+          path: |
+            build/logs/**/*.log
+            ${{ runner.temp }}/husk-derived-data/build.log
+          if-no-files-found: ignore
+          retention-days: 7

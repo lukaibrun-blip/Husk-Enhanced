@@ -193,6 +193,7 @@ bool tl_unity_start(const tl_unity_config *cfg)
     tl_set_data_dir(cfg->data_dir);
     tl_nwindow_configure(cfg->width, cfg->height, cfg->metal_layer);
     int n = tl_dexidx_open(cfg->apk_path);
+    if (n < 0) { tl_log_line("unity: could not safely index the APK's DEX"); return false; }
     tl_log_line("unity: %d classes in the APK's DEX", n);
     if (!tl_ld_add_apk(cfg->apk_path)) return false;
     /* A player built to require ES 3.1 or 3.2 (its manifest's glEsVersion) asks only for those contexts and gives up on "your

@@ -21,8 +21,11 @@
 extern "C" {
 #endif
 
-/* Index every classes*.dex in the APK. Returns the number of classes, or -1. */
+/* Index every numbered classes*.dex entry in the APK and queued splits. Caps the app at 768 DEX files, 256 MiB of DEX data,
+ * 1,048,576 classes and 16,777,216 strings; returns -1 if a limit is exceeded or a DEX header, table, index or class-data stream is invalid. */
 int tl_dexidx_open(const char *apk_path);
+/* Release the current app's DEX files and class index. */
+void tl_dexidx_reset(void);
 
 /* `name` in JNI form: "com/unity3d/player/UnityPlayer". */
 bool tl_dexidx_has_class(const char *name);

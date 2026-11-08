@@ -193,11 +193,16 @@ NAT(N_log)
     return true;
 }
 /* Assets: the app's APK first, then its splits and asset packs (a Play install keeps a game's data in an install-time asset pack). */
+static uint32_t rd32le(const uint8_t *p);
+static uint16_t rd16le(const uint8_t *p);
 static const tl_zip_entry *asset_find(const char *n, const tl_zip **zout)
 {
     /* "/lib/x.so": a file from the APK's root (openNonAssetFd), which asset names never start with */
-    char path[1024]; if (n && n[0] == '/') snprintf(path, sizeof(path), "%s", n + 1); else snprintf(path, sizeof(path), "assets/%s", n ? n : "");
-    for (int i = 0; i < 16; i++) {
+    char path[1024];
+    int length = n && n[0] == '/' ? snprintf(path, sizeof(path), "%s", n + 1)
+                                  : snprintf(path, sizeof(path), "assets/%s", n ? n : "");
+    if (length < 0 || (size_t)length >= sizeof(path)) return NULL;
+    for (int i = 0; ; i++) {
         const tl_zip *z = tl_ld_apk_at(i);
         if (!z) { if (i == 0) continue; break; }
         const tl_zip_entry *e = tl_zip_find(z, path);
@@ -205,6 +210,53 @@ static const tl_zip_entry *asset_find(const char *n, const tl_zip **zout)
     }
     return NULL;
 }
+
+static bool stored_entry_offset(const tl_zip *z, const tl_zip_entry *e, uint64_t *data_offset)
+{
+    if (!z || !e || !e->name || !data_offset || !z->map || e->method != 0 || (e->flags & 0x2041) ||
+        e->local_offset > z->size || z->size - e->local_offset < 30) return false;
+    const uint8_t *lh = z->map + e->local_offset;
+    if (rd32le(lh) != 0x04034b50u || rd16le(lh + 6) != e->flags || rd16le(lh + 8) != e->method) return false;
+    uint16_t name_len = rd16le(lh + 26), extra_len = rd16le(lh + 28);
+    size_t entry_name_len = strlen(e->name);
+    uint64_t header_len = 30ull + name_len + extra_len;
+    if (header_len > z->size - e->local_offset || name_len != entry_name_len ||
+        memcmp(lh + 30, e->name, name_len)) return false;
+    uint64_t offset = e->local_offset + header_len;
+    if (offset > z->size || e->csize > z->size - offset || e->usize != e->csize) return false;
+    *data_offset = offset;
+    return true;
+}
+
+static jobj *zip_byte_array(const uint8_t *data, size_t len, bool owned)
+{
+    if (len > INT32_MAX) {
+        if (owned) free((void *)data);
+        tl_jni_throw("java/lang/OutOfMemoryError", "APK entry is too large for a Java byte array");
+        return NULL;
+    }
+    jobj *arr = tl_jni_new_prim_array('B', (uint32_t)len);
+    if (!arr || (len && !arr->arr.data)) {
+        if (owned) free((void *)data);
+        tl_jni_throw("java/lang/OutOfMemoryError", "could not allocate a Java byte array for an APK entry");
+        return NULL;
+    }
+    arr->refs = 1u << 30;
+    if (len) memcpy(arr->arr.data, data, len);
+    if (owned) free((void *)data);
+    return arr;
+}
+
+static int64_t pack_file_descriptor(int fd, uint64_t offset)
+{
+    if (fd < 0) return -1;
+    if ((uint64_t)fd > ((uint64_t)INT64_MAX >> 40) || offset > ((1ull << 40) - 1)) {
+        close(fd);
+        return -1;
+    }
+    return (int64_t)(((uint64_t)fd << 40) | offset);
+}
+
 NAT(N_readAsset)
 {
     (void)self;
@@ -213,21 +265,73 @@ NAT(N_readAsset)
     if (!e) { *ret = L(NULL); return true; }
     const uint8_t *d; size_t len; bool owned; char err[160];
     if (!tl_zip_data(z, e, (size_t)1 << 30, &d, &len, &owned, err, sizeof(err))) { *ret = L(NULL); return true; }
-    jobj *arr = tl_jni_new_prim_array('B', (uint32_t)len);
-    arr->refs = 1u << 30;
-    memcpy(arr->arr.data, d, len);
-    if (owned) free((void *)d);
-    *ret = L(arr);
+    *ret = L(zip_byte_array(d, len, owned));
     return true;
 }
+
+static uint64_t asset_name_hash(const char *name, size_t len)
+{
+    uint64_t hash = 14695981039346656037ull;
+    for (size_t i = 0; i < len; i++) { hash ^= (unsigned char)name[i]; hash *= 1099511628211ull; }
+    return hash;
+}
+
+static bool list_asset_add(char ***names, size_t *count, size_t *capacity,
+                           char ***slots, size_t *slot_capacity, const char *name, size_t len)
+{
+    if (len == SIZE_MAX || *count >= INT32_MAX) return false;
+    if (!*slot_capacity || *count >= *slot_capacity - *slot_capacity / 3) {
+        size_t new_capacity = *slot_capacity ? *slot_capacity * 2 : 64;
+        if (*slot_capacity && new_capacity < *slot_capacity) return false;
+        if (new_capacity > SIZE_MAX / sizeof(**slots)) return false;
+        char **new_slots = calloc(new_capacity, sizeof(*new_slots));
+        if (!new_slots) return false;
+        for (size_t i = 0; i < *count; i++) {
+            size_t slot = (size_t)asset_name_hash((*names)[i], strlen((*names)[i])) & (new_capacity - 1);
+            while (new_slots[slot]) slot = (slot + 1) & (new_capacity - 1);
+            new_slots[slot] = (*names)[i];
+        }
+        free(*slots);
+        *slots = new_slots;
+        *slot_capacity = new_capacity;
+    }
+    uint64_t hash = asset_name_hash(name, len);
+    size_t slot = (size_t)hash & (*slot_capacity - 1);
+    while ((*slots)[slot]) {
+        if (strlen((*slots)[slot]) == len && !memcmp((*slots)[slot], name, len)) return true;
+        slot = (slot + 1) & (*slot_capacity - 1);
+    }
+    char *copy = malloc(len + 1);
+    if (!copy) return false;
+    memcpy(copy, name, len);
+    copy[len] = 0;
+    if (*count == *capacity) {
+        size_t new_capacity = *capacity ? *capacity * 2 : 32;
+        if (*capacity && new_capacity < *capacity) { free(copy); return false; }
+        if (new_capacity > (size_t)INT32_MAX) new_capacity = INT32_MAX;
+        if (new_capacity > SIZE_MAX / sizeof(**names)) { free(copy); return false; }
+        char **new_names = realloc(*names, new_capacity * sizeof(*new_names));
+        if (!new_names) { free(copy); return false; }
+        *names = new_names;
+        *capacity = new_capacity;
+    }
+    (*names)[(*count)++] = copy;
+    (*slots)[slot] = copy;
+    return true;
+}
+
 NAT(N_listAssets)
 {
     (void)self;
     const char *dir = tl_jni_string(a[0].l);
-    char prefix[1024]; snprintf(prefix, sizeof(prefix), "assets/%s%s", dir ? dir : "", dir && *dir ? "/" : "");
-    size_t pl = strlen(prefix);
-    char **names = NULL; int n = 0, cap = 0;
-    for (int zi = 0; zi < 16; zi++) {
+    char prefix[1024];
+    int prefix_len = snprintf(prefix, sizeof(prefix), "assets/%s%s", dir ? dir : "", dir && *dir ? "/" : "");
+    if (prefix_len < 0 || (size_t)prefix_len >= sizeof(prefix)) { *ret = L(NULL); return true; }
+    size_t pl = (size_t)prefix_len;
+    char **names = NULL, **slots = NULL;
+    size_t n = 0, cap = 0, slot_cap = 0;
+    bool failed = false;
+    for (int zi = 0; !failed; zi++) {
         const tl_zip *z = tl_ld_apk_at(zi);
         if (!z) { if (zi == 0) continue; break; }
         for (size_t i = 0; i < z->count; i++) {
@@ -235,18 +339,39 @@ NAT(N_listAssets)
             if (strncmp(en, prefix, pl)) continue;
             const char *rest = en + pl;
             if (!*rest) continue;
-            size_t l = strcspn(rest, "/");
-            bool dup = false;
-            for (int k = 0; k < n && !dup; k++) dup = strlen(names[k]) == l && !strncmp(names[k], rest, l);
-            if (dup) continue;
-            if (n == cap) { cap = cap ? cap * 2 : 32; names = realloc(names, (size_t)cap * sizeof(*names)); }
-            names[n++] = strndup(rest, l);
+            size_t len = strcspn(rest, "/");
+            if (!list_asset_add(&names, &n, &cap, &slots, &slot_cap, rest, len)) { failed = true; break; }
         }
     }
+    free(slots);
+    if (failed) {
+        for (size_t i = 0; i < n; i++) free(names[i]);
+        free(names);
+        tl_jni_throw("java/lang/OutOfMemoryError", "could not list APK assets");
+        *ret = L(NULL);
+        return true;
+    }
     jobj *arr = tl_jni_new_obj_array(tl_jni_class("java/lang/String"), (uint32_t)n);
+    if (!arr || (n && !arr->oarr.v)) {
+        for (size_t i = 0; i < n; i++) free(names[i]);
+        free(names);
+        tl_jni_throw("java/lang/OutOfMemoryError", "could not allocate the APK asset list");
+        *ret = L(NULL);
+        return true;
+    }
     arr->cls = tl_jni_class("[Ljava/lang/String;");
     arr->refs = 1u << 30;
-    for (int i = 0; i < n; i++) { arr->oarr.v[i] = jstr(names[i]); free(names[i]); }
+    for (size_t i = 0; i < n; i++) {
+        arr->oarr.v[i] = jstr(names[i]);
+        free(names[i]);
+        if (!arr->oarr.v[i]) {
+            for (size_t j = i + 1; j < n; j++) free(names[j]);
+            free(names);
+            tl_jni_throw("java/lang/OutOfMemoryError", "could not allocate an APK asset name");
+            *ret = L(NULL);
+            return true;
+        }
+    }
     free(names);
     *ret = L(arr);
     return true;
@@ -257,14 +382,19 @@ NAT(N_assetFd)
     (void)self;
     const tl_zip *z = NULL;
     const tl_zip_entry *e = asset_find(tl_jni_string(a[0].l), &z);
-    if (!e || e->method != 0) { *ret = J(-1); return true; }
-    const uint8_t *lh = z->map + e->local_offset;
-    uint64_t data = e->local_offset + 30 + (lh[26] | lh[27] << 8) + (lh[28] | lh[29] << 8);
+    uint64_t data;
+    if (!e || !stored_entry_offset(z, e, &data)) { *ret = J(-1); return true; }
     int fd = z == tl_ld_apk_at(0) ? open(A.apk, O_RDONLY) : dup(z->fd);
-    *ret = J(fd < 0 ? -1 : ((int64_t)fd << 40) | (int64_t)data);
+    *ret = J(pack_file_descriptor(fd, data));
     return true;
 }
-NAT(N_assetLength) { (void)self; const tl_zip_entry *e = asset_find(tl_jni_string(a[0].l), NULL); *ret = J(e ? (int64_t)e->usize : -1); return true; }
+NAT(N_assetLength)
+{
+    (void)self;
+    const tl_zip_entry *e = asset_find(tl_jni_string(a[0].l), NULL);
+    *ret = J(e && e->usize <= INT64_MAX ? (int64_t)e->usize : -1);
+    return true;
+}
 NAT(N_dataDir) { (void)self; (void)a; *ret = L(jstr(A.data)); return true; }
 NAT(N_externalDir) { (void)self; (void)a; *ret = L(jstr(A.ext)); return true; }
 NAT(N_packageName) { (void)self; (void)a; *ret = L(jstr(A.pkg)); return true; }
@@ -331,11 +461,23 @@ NAT(N_splitPaths)
 {
     (void)self; (void)a;
     int n = 0;
-    while (n < 16 && tl_ld_queued_split(n)) n++;
+    while (n < TL_LD_MAX_APKS - 1 && tl_ld_queued_split(n)) n++;
     jobj *arr = tl_jni_new_obj_array(tl_jni_class("java/lang/String"), (uint32_t)n);
+    if (!arr || (n && !arr->oarr.v)) {
+        tl_jni_throw("java/lang/OutOfMemoryError", "could not allocate the APK split path list");
+        *ret = L(NULL);
+        return true;
+    }
     arr->cls = tl_jni_class("[Ljava/lang/String;");
     arr->refs = 1u << 30;
-    for (int i = 0; i < n; i++) arr->oarr.v[i] = jstr(tl_ld_queued_split(i));
+    for (int i = 0; i < n; i++) {
+        arr->oarr.v[i] = jstr(tl_ld_queued_split(i));
+        if (!arr->oarr.v[i]) {
+            tl_jni_throw("java/lang/OutOfMemoryError", "could not allocate an APK split path");
+            *ret = L(NULL);
+            return true;
+        }
+    }
     *ret = L(arr);
     return true;
 }
@@ -348,11 +490,7 @@ NAT(N_readApkFile)
     if (!e) { *ret = L(NULL); return true; }
     const uint8_t *d; size_t len; bool owned; char err[160];
     if (!tl_zip_data(z, e, (size_t)1 << 30, &d, &len, &owned, err, sizeof(err))) { *ret = L(NULL); return true; }
-    jobj *arr = tl_jni_new_prim_array('B', (uint32_t)len);
-    arr->refs = 1u << 30;
-    memcpy(arr->arr.data, d, len);
-    if (owned) free((void *)d);
-    *ret = L(arr);
+    *ret = L(zip_byte_array(d, len, owned));
     return true;
 }
 NAT(N_apkFileFd)
@@ -361,11 +499,10 @@ NAT(N_apkFileFd)
     const char *n = tl_jni_string(a[1].l), *path;
     const tl_zip *z = apk_n(a[0].i, &path);
     const tl_zip_entry *e = z && n ? tl_zip_find(z, n) : NULL;
-    if (!e || e->method != 0) { *ret = J(-1); return true; }
-    const uint8_t *lh = z->map + e->local_offset;
-    uint64_t data = e->local_offset + 30 + (lh[26] | lh[27] << 8) + (lh[28] | lh[29] << 8);
+    uint64_t data;
+    if (!e || !stored_entry_offset(z, e, &data)) { *ret = J(-1); return true; }
     int fd = path && path[0] ? open(path, O_RDONLY) : dup(z->fd);
-    *ret = J(fd < 0 ? -1 : ((int64_t)fd << 40) | (int64_t)data);
+    *ret = J(pack_file_descriptor(fd, data));
     return true;
 }
 NAT(N_apkFileLength)
@@ -374,7 +511,7 @@ NAT(N_apkFileLength)
     const char *n = tl_jni_string(a[1].l);
     const tl_zip *z = apk_n(a[0].i, NULL);
     const tl_zip_entry *e = z && n ? tl_zip_find(z, n) : NULL;
-    *ret = J(e ? (int64_t)e->usize : -1);
+    *ret = J(e && e->usize <= INT64_MAX ? (int64_t)e->usize : -1);
     return true;
 }
 NAT(N_apkPath) { (void)self; (void)a; *ret = L(jstr(A.apk)); return true; }

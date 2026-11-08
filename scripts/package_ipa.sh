@@ -137,7 +137,7 @@ fi
 # @rpath/libANGLE-shared.dylib". Everything else in this validation passed. A
 # check that covers one of two required libraries is a check that reports
 # success on a bundle that cannot launch.
-for lib in libqemu-aarch64-softmmu.dylib libANGLE-shared.dylib libhuskps4.dylib; do
+for lib in libqemu-aarch64-softmmu.dylib libANGLE-shared.dylib; do
     if [ ! -f "$APP/Frameworks/$lib" ]; then
         echo "  MISSING  Frameworks/$lib" >&2
         rc=1
@@ -146,6 +146,18 @@ for lib in libqemu-aarch64-softmmu.dylib libANGLE-shared.dylib libhuskps4.dylib;
             "$(du -h "$APP/Frameworks/$lib" | cut -f1)"
     fi
 done
+PS4_SOURCE="$HUSK_ROOT/build/ios-arm64/lib/libhuskps4.dylib"
+if [ -f "$PS4_SOURCE" ]; then
+    if [ ! -f "$APP/Frameworks/libhuskps4.dylib" ]; then
+        echo "  MISSING  Frameworks/libhuskps4.dylib (PS4 layer was built but not embedded)" >&2
+        rc=1
+    else
+        printf "  ok       %-28s %s\n" "PS4 layer embedded" \
+            "$(du -h "$APP/Frameworks/libhuskps4.dylib" | cut -f1)"
+    fi
+else
+    echo "  SKIP     optional PS4 layer is not available in this build"
+fi
 
 # Guest images, firmware, and blank disk seeds required by first launch.
 for f in vmlinuz-virt initramfs-virt husk-jit.js \

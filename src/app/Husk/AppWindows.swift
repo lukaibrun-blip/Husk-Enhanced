@@ -165,7 +165,7 @@ private struct AppWindow: View {
             WebAppSurface(app: app)
         } else if let apk = app.apks.first {
             TLWindowScreen(apk: apk, extraApks: Array(app.apks.dropFirst()), dataDir: app.nativeDataDir,
-                           engine: app.screenEngine, portrait: portrait, scale: settings.resolution.scale)
+                           engine: app.screenEngine, renderer: settings.renderer, portrait: portrait, scale: settings.resolution.scale)
                 .overlay {
                     if model.frames == 0 {
                         VStack(spacing: 10) {
@@ -311,12 +311,13 @@ struct TLWindowScreen: UIViewRepresentable {
     let extraApks: [String]
     let dataDir: String
     let engine: TLNativeEngine
+    let renderer: TLAppSettings.Renderer
     let portrait: Bool
     let scale: CGFloat
 
     func makeUIView(context: Context) -> TLWindowHost {
         TLWindowHost(game: TLUnityScreen.view(apk: apk, extraApks: extraApks, dataDir: dataDir, engine: engine,
-                                              portrait: portrait, scale: scale))
+                                              renderer: renderer, portrait: portrait, scale: scale))
     }
     func updateUIView(_ view: TLWindowHost, context: Context) { view.setNeedsLayout() }
 }

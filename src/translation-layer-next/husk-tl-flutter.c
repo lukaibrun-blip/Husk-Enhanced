@@ -394,6 +394,7 @@ bool tl_flutter_start(const tl_ga_config *cfg)
     tl_set_data_dir(cfg->data_dir);
     tl_nwindow_configure(cfg->width, cfg->height, cfg->metal_layer);
     int n = tl_dexidx_open(cfg->apk_path);
+    if (n < 0) { tl_log_line("flutter: could not safely index the APK's DEX"); return false; }
     tl_log_line("flutter: %d classes in the APK's DEX", n);
     if (!tl_dexidx_has_class(FJNI)) { tl_log_line("flutter: the APK has no %s", FJNI); return false; }
     if (!tl_ld_add_apk(cfg->apk_path)) return false;

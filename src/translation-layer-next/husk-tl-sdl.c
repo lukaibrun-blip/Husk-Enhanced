@@ -755,6 +755,7 @@ bool tl_sdl_start(const tl_ga_config *cfg, const char *activity_class)
     tl_set_data_dir(cfg->data_dir);
     tl_nwindow_configure(cfg->width, cfg->height, cfg->metal_layer);
     int n = tl_dexidx_open(cfg->apk_path);
+    if (n < 0) { tl_log_line("sdl: could not safely index the APK's DEX"); return false; }
     tl_log_line("sdl: %d classes in the APK's DEX", n);
     if (!tl_ld_add_apk(cfg->apk_path)) return false;
     /* The activity SDL runs under: the one the caller named if it is an SDLActivity, else the manifest's activity that is (Dungeon Crawl and Wesnoth put a menu in front). */

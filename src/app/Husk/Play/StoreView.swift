@@ -10,6 +10,7 @@ struct StoreView: View {
     @State private var searchText = ""
     @State private var debouncedSearchText = ""
     @State private var showSignIn = false
+    @State private var showAPKStore = false
     @State private var selectedApp: PlayAPI.PlayApp?
     @State private var shelf: StoreShelf = .featured
     @State private var opening: String?
@@ -32,6 +33,10 @@ struct StoreView: View {
             .searchable(text: $searchText, prompt: "Search Google Play")
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button { showAPKStore = true } label: {
+                        Image(systemName: "shippingbox")
+                    }
+                    .accessibilityLabel("Browse APK repositories")
                     if !manager.downloadProgress.isEmpty {
                         Button { Router.shared.showDownloads = true } label: {
                             Label("\(manager.downloadProgress.count) Downloading", systemImage: "arrow.down.circle")
@@ -79,6 +84,9 @@ struct StoreView: View {
             }
             .sheet(isPresented: $showSignIn) {
                 GoogleSignInSheet()
+            }
+            .sheet(isPresented: $showAPKStore) {
+                NavigationStack { DiscoverView() }
             }
             .onReceive(Router.shared.$storePackage) { pkg in
                 guard let pkg else { return }

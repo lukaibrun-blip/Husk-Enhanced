@@ -436,6 +436,21 @@ static void bionic_abort(void)
 /* When set, a guest exit() ends the guest, not the app that is hosting it. The hook does not return. */
 void (*tl_guest_exit_hook)(int status);
 
+void tl_bionic_guest_exit(int status)
+{
+    if (tl_guest_exit_hook) tl_guest_exit_hook(status);
+    _exit(status);
+}
+
+static void bionic_immediate_exit(int status)
+{
+    char where[200];
+    describe_caller(__builtin_return_address(0), where, sizeof(where));
+    tl_log_line("bionic: _exit(%d) called from %s", status, where);
+    log_guest_frames(__builtin_frame_address(1));
+    tl_bionic_guest_exit(status);
+}
+
 static void bionic_exit(int status)
 {
     char where[200];
@@ -832,7 +847,7 @@ const tl_bionic_entry tl_tab_core[] = {
     TL_WRAP("closelog", bionic_closelog),
     TL_WRAP("abort", bionic_abort),
     TL_WRAP("exit", bionic_exit),
-    TL_DIRECT(_exit), TL_DIRECT(_Exit),
+    TL_WRAP("_exit", bionic_immediate_exit), TL_WRAP("_Exit", bionic_immediate_exit),
     TL_WRAP("__stack_chk_fail", bionic___stack_chk_fail),
     TL_WRAP("__assert2", bionic___assert2),
     TL_WRAP("android_set_abort_message", bionic_android_set_abort_message),

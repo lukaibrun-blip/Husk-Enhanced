@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "husk-tl-internal.h"
+#include "husk-tl-dexindex.h"
 #include "husk-tl-a64.h"
 #include "husk-tl-arm32.h"
 #include "husk-tl-xmem.h"
@@ -200,7 +201,16 @@ static char g_apk_paths[TL_LD_MAX_APKS][1024];
 
 void tl_ld_queue_split(const char *path)
 {
-    if (path && path[0] && g_nsplits < TL_LD_MAX_APKS) snprintf(g_splits[g_nsplits++], sizeof(g_splits[0]), "%s", path);
+    if (!path || !path[0]) return;
+    if (strlen(path) >= sizeof(g_splits[0])) {
+        tl_log_line("ld: split path is too long; ignoring it");
+        return;
+    }
+    if (g_nsplits >= TL_LD_MAX_APKS - 1) {
+        tl_log_line("ld: split limit (%d additional APKs) reached; ignoring %s", TL_LD_MAX_APKS - 1, path);
+        return;
+    }
+    snprintf(g_splits[g_nsplits++], sizeof(g_splits[0]), "%s", path);
 }
 
 const char *tl_ld_queued_split(int i) { return i >= 0 && i < g_nsplits ? g_splits[i] : NULL; }
@@ -249,7 +259,8 @@ void tl_ld_reset_session(void)
     G.nlibs = keep;
     pthread_mutex_unlock(&g_big);
     tl_a32_reset();
-    tl_log_line("ld: the app's libraries are forgotten; another APK can load");
+    tl_dexidx_reset();
+    tl_log_line("ld: the app's libraries and DEX index are forgotten; another APK can load");
 }
 
 const tl_zip *tl_ld_apk_at(int i) { return (i >= 0 && i < G.napks) ? &G.apks[i] : NULL; }

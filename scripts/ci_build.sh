@@ -51,6 +51,15 @@ fi
 step "on-device pairing (Rust)"
 ./scripts/build_rppairing_ios.sh
 
+PS4_CORE="${BACHATA_DIR:-$HOME/Documents/Coding/AetherCore4/Bachata-S4}"
+PS4_FEX="${HUSK_FEX_DIR:-$HOME/Documents/Coding/husk-fex}"
+if [ -d "$PS4_CORE/.git" ] && [ -d "$PS4_FEX/.git" ]; then
+    step "optional PS4 layer"
+    BACHATA_DIR="$PS4_CORE" HUSK_FEX_DIR="$PS4_FEX" ./scripts/build_ps4_ios.sh
+else
+    step "optional PS4 layer omitted (separate Bachata-S4 and FEXCore checkouts not present)"
+fi
+
 step "app + IPA"
 mkdir -p "$(dirname "$OUT")"
 ./scripts/package_ipa.sh "$OUT"

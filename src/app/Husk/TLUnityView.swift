@@ -43,6 +43,7 @@ final class TLUnityUIView: UIView, UIKeyInput {
     private let extraApks: [String]
     private let dataDir: String
     let engine: TLNativeEngine
+    private var renderer: TLAppSettings.Renderer
     /// A portrait game is told its size when the screen is taller than wide, as a landscape one is when it is wider.
     private let portrait: Bool
     private(set) var launched = false
@@ -64,11 +65,12 @@ final class TLUnityUIView: UIView, UIKeyInput {
     /// Called when three fingers tap at once: the way back to the interface while it is hidden.
     var onThreeFingerTap: (() -> Void)?
 
-    init(apk: String, extraApks: [String] = [], dataDir: String, engine: TLNativeEngine, portrait: Bool = false, scale: CGFloat = 2) {
+    init(apk: String, extraApks: [String] = [], dataDir: String, engine: TLNativeEngine, renderer: TLAppSettings.Renderer = .automatic, portrait: Bool = false, scale: CGFloat = 2) {
         self.apk = apk
         self.portrait = portrait
         self.dataDir = dataDir
         self.engine = engine
+        self.renderer = renderer
         self.extraApks = extraApks
         super.init(frame: .zero)
         backgroundColor = .black
@@ -249,11 +251,23 @@ final class TLUnityUIView: UIView, UIKeyInput {
         setNeedsLayout()
     }
 
+    func updateRenderer(_ renderer: TLAppSettings.Renderer) {
+        if !launched { self.renderer = renderer }
+    }
+
     private func launch(width: Int, height: Int) {
         launched = true
         launchedSize = bounds.size
         let angle = (Bundle.main.privateFrameworksPath ?? "") + "/libANGLE-shared.dylib"
         let ca = Bundle.main.path(forResource: "cacert", ofType: "pem") ?? ""
+        let moltenVK = (Bundle.main.privateFrameworksPath ?? "") + "/MoltenVK.framework/MoltenVK"
+        let hasMoltenVK = FileManager.default.fileExists(atPath: moltenVK)
+        let canChooseRenderer = engine == .sdl || engine == .ue4
+        let selectedRenderer: TLAppSettings.Renderer = !canChooseRenderer || (renderer == .vulkan && !hasMoltenVK)
+            ? .automatic : renderer
+        if canChooseRenderer && renderer == .vulkan && !hasMoltenVK {
+            HuskLog.log("tl", "MoltenVK is missing; using the automatic renderer for this launch")
+        }
         try? FileManager.default.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
         let layerPtr = Unmanaged.passUnretained(layer).toOpaque()
         let loaded = husk_native_loaded_apk().map { String(cString: $0) }
@@ -267,6 +281,28 @@ final class TLUnityUIView: UIView, UIKeyInput {
             HuskLog.log("tl", "native: \(loaded ?? "another app") is still loaded; close Husk to start \(apk)")
             return
         }
+        husk_ue4_set_vulkan(nil)
+        if canChooseRenderer && selectedRenderer != .openGLES && hasMoltenVK {
+            moltenVK.withCString { husk_ue4_set_vulkan($0) }
+        }
+        if engine == .sdl && (selectedRenderer == .openGLES || !hasMoltenVK) {
+            setenv("TL_SDL_NO_VULKAN", "1", 1)
+        } else {
+            unsetenv("TL_SDL_NO_VULKAN")
+        }
+        unsetenv("TL_UE4_NO_VULKAN")
+        unsetenv("TL_UE4_FORCE_VULKAN")
+        if engine == .ue4 {
+            switch selectedRenderer {
+            case .automatic:
+                break
+            case .openGLES:
+                setenv("TL_UE4_NO_VULKAN", "1", 1)
+            case .vulkan:
+                setenv("TL_UE4_FORCE_VULKAN", "1", 1)
+            }
+        }
+        HuskLog.log("tl", "renderer policy: \(selectedRenderer.title) for \(engine)")
         // The game plays through the silent switch, like the guest's own audio, and mixes with other audio. Unity games too:
         // they used to be left out, from before they had sound, and played through a session that was never set up.
         do {
@@ -278,7 +314,7 @@ final class TLUnityUIView: UIView, UIKeyInput {
         // Splits and the asset pack are part of the app, whatever its engine; the game's libraries and data may be in any of
         // them (a Google Play install keeps a Unity game's libraries in one split and its data in an asset pack).
         JITLess.prepareLaunch()
-        for extra in extraApks.prefix(15) { husk_native_add_package(extra) }
+        for extra in extraApks { husk_native_add_package(extra) }
         // Android's shared storage, one folder for every game: a game that keeps its data in a folder of its own on /sdcard finds it
         // in Husk's "Shared Storage", which can be filled from Files or Finder.
         husk_native_set_shared_storage(TranslationLayer.sharedStorage.path)
@@ -295,15 +331,16 @@ final class TLUnityUIView: UIView, UIKeyInput {
                 let k = contentScaleFactor
                 husk_sdl_set_safe_insets(Int32(inset.left * k), Int32(inset.top * k), Int32(inset.right * k), Int32(inset.bottom * k))
             }
-            // Vulkan for the SDL games that draw with it (directly, or through DXVK): MoltenVK, as for Unreal.
-            if let fw = Bundle.main.privateFrameworksPath { husk_ue4_set_vulkan(fw + "/MoltenVK.framework/MoltenVK") }
-            started = husk_sdl_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
+            if selectedRenderer == .vulkan {
+                // Skip ANGLE so a manual Vulkan choice cannot silently start an OpenGL ES renderer.
+                started = husk_sdl_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), nil, ca)
+            } else {
+                started = husk_sdl_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
+            }
         case .gta: started = husk_gta_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
         case .godot: started = husk_godot_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
         case .nativeactivity: started = husk_ue4_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)       // the NativeActivity driver; with no Unreal in the APK it runs the plain game
         case .ue4:
-            // Unreal draws with Vulkan, which on this device is MoltenVK, a framework of the app's own.
-            if let fw = Bundle.main.privateFrameworksPath { husk_ue4_set_vulkan(fw + "/MoltenVK.framework/MoltenVK") }
             started = husk_ue4_launch(apk, dataDir, layerPtr, Int32(width), Int32(height), angle, ca)
         case .cocos:
             // Geode, when it is on for this game and downloaded: loaded into the game after its own libraries.
@@ -734,6 +771,7 @@ struct TLUnityScreen: UIViewRepresentable {
     var extraApks: [String] = []
     let dataDir: String
     var engine: TLNativeEngine = .unity
+    var renderer: TLAppSettings.Renderer = .automatic
     var portrait = false
     var scale: CGFloat = 2
     var onStats: ((String) -> Void)? = nil
@@ -743,9 +781,12 @@ struct TLUnityScreen: UIViewRepresentable {
     private static var shared: [String: TLUnityUIView] = [:]
 
     /// The game's one view, made the first time it is asked for.
-    static func view(apk: String, extraApks: [String], dataDir: String, engine: TLNativeEngine, portrait: Bool, scale: CGFloat) -> TLUnityUIView {
-        if let view = shared[apk] { return view }
-        let view = TLUnityUIView(apk: apk, extraApks: extraApks, dataDir: dataDir, engine: engine, portrait: portrait, scale: scale)
+    static func view(apk: String, extraApks: [String], dataDir: String, engine: TLNativeEngine, renderer: TLAppSettings.Renderer = .automatic, portrait: Bool, scale: CGFloat) -> TLUnityUIView {
+        if let view = shared[apk] {
+            view.updateRenderer(renderer)
+            return view
+        }
+        let view = TLUnityUIView(apk: apk, extraApks: extraApks, dataDir: dataDir, engine: engine, renderer: renderer, portrait: portrait, scale: scale)
         shared[apk] = view
         return view
     }
@@ -754,15 +795,20 @@ struct TLUnityScreen: UIViewRepresentable {
         if let view = Self.shared[apk] {
             view.windowed = false
             view.transform = .identity
+            view.updateRenderer(renderer)
             view.onStats = onStats; view.onThreeFingerTap = onThreeFingerTap; return view
         }
-        let view = TLUnityUIView(apk: apk, extraApks: extraApks, dataDir: dataDir, engine: engine, portrait: portrait, scale: scale)
+        let view = TLUnityUIView(apk: apk, extraApks: extraApks, dataDir: dataDir, engine: engine, renderer: renderer, portrait: portrait, scale: scale)
         view.onStats = onStats
         view.onThreeFingerTap = onThreeFingerTap
         Self.shared[apk] = view
         return view
     }
-    func updateUIView(_ view: TLUnityUIView, context: Context) { view.onStats = onStats; view.onThreeFingerTap = onThreeFingerTap }
+    func updateUIView(_ view: TLUnityUIView, context: Context) {
+        view.updateRenderer(renderer)
+        view.onStats = onStats
+        view.onThreeFingerTap = onThreeFingerTap
+    }
 }
 
 /// Polls the runtime for the status line and its log, ten times a second at most.
@@ -885,8 +931,9 @@ struct TLCocosAttemptView: View {
                 if let apk = app.apks.first {
                     // The game always has the whole screen: it is told its size once, as it starts, so nothing may take space from it.
                     // The bar and the log are drawn over it instead, and hiding them shows everything underneath.
-                    TLUnityScreen(apk: apk, extraApks: Array(app.apks.dropFirst()), dataDir: dataDir, engine: engine, portrait: portrait,
-                                  scale: settings.resolution.scale, onStats: { stats = $0 }, onThreeFingerTap: { toggleInterface() })
+                    TLUnityScreen(apk: apk, extraApks: Array(app.apks.dropFirst()), dataDir: dataDir, engine: engine,
+                                  renderer: settings.renderer, portrait: portrait, scale: settings.resolution.scale,
+                                  onStats: { stats = $0 }, onThreeFingerTap: { toggleInterface() })
                         .background(Color.black)
                     .overlay {
                         // A game whose menus answer only a controller: with none paired, one on the glass. Hiding the bar leaves

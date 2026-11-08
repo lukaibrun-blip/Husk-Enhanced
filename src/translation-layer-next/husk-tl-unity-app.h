@@ -40,6 +40,7 @@ bool husk_gameactivity_launch(const char *apk, const char *data_dir, void *metal
 /*
  * The same for a game built on SDL3 (Beach Buggy Racing 2): landscape, sound, multi-touch. Its libraries may be in a split, and its data in an asset pack, so every
  * other APK of the app is given first with husk_native_add_package. The game's activity is the launcher activity of the manifest.
+ * `angle_dylib` may be NULL for a Vulkan-only launch.
  */
 bool husk_sdl_launch(const char *apk, const char *data_dir, void *metal_layer, int width, int height,
                      const char *angle_dylib, const char *ca_bundle);
@@ -109,7 +110,7 @@ void husk_flutter_set_close_handler(void (*fn)(void));                /* the app
 /* Where fonts downloaded after install are (the CJK ones): /system/fonts files the bundle lacks are looked for there. */
 void husk_native_set_extra_fonts(const char *dir);
 void husk_native_set_system_files(const char *cacerts_dir, const char *fonts_root);
-/* Another APK of the app about to be launched (a split, an asset pack). Before the launch call; at most three. */
+/* Another APK of the app about to be launched (a split or asset pack). Before launch; at most 47 additional APKs. */
 void husk_native_add_package(const char *apk);
 /* The folder games see as Android's shared storage (/sdcard outside their own Android/data), or NULL for each game's own. */
 void husk_native_set_shared_storage(const char *dir);

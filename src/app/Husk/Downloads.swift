@@ -1,11 +1,33 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import AVFoundation
 import BackgroundTasks
+import CryptoKit
 import Foundation
 import UIKit
 #if canImport(ActivityKit)
 import ActivityKit
 #endif
+
+private struct DownloadContentRange {
+    let total: Int64
+    let bodyLength: Int64
+}
+
+private func downloadContentRange(_ value: String?, _ offset: Int64) -> DownloadContentRange? {
+    guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+          value.lowercased().hasPrefix("bytes ") else { return nil }
+    let rangeAndTotal = value.dropFirst(6).split(separator: "/", maxSplits: 1)
+    guard rangeAndTotal.count == 2,
+          let total = Int64(String(rangeAndTotal[1])), total > 0 else { return nil }
+    let bounds = rangeAndTotal[0].split(separator: "-", maxSplits: 1)
+    guard bounds.count == 2,
+          let start = Int64(String(bounds[0])), let end = Int64(String(bounds[1])),
+          start >= 0, start == offset, end >= start, end < total else { return nil }
+    let (difference, differenceOverflow) = end.subtractingReportingOverflow(start)
+    let (bodyLength, lengthOverflow) = difference.addingReportingOverflow(1)
+    guard !differenceOverflow, !lengthOverflow else { return nil }
+    return DownloadContentRange(total: total, bodyLength: bodyLength)
+}
 
 /// Downloads from a link: one file, or a whole folder served from a computer (tools/serve-folder.py).
 ///
@@ -29,12 +51,14 @@ final class Downloads: ObservableObject {
         var url: String
         var size: Int64             // 0 when not known
         var received: Int64 = 0
+        var sha256: String? = nil
         var done = false
         var error: String?
     }
 
     struct Job: Codable, Identifiable, Hashable {
-        enum Kind: String, Codable { case file, folder, apk }
+        enum Kind: String, Codable { case file, folder, apk, bundle }
+        enum Ingestion: String, Codable, Hashable { case adding, added, failed, interrupted }
         var id = UUID()
         var title: String
         var source: String
@@ -43,12 +67,15 @@ final class Downloads: ObservableObject {
         var added = Date()
         var paused = false
         var finished: Date?
+        var ingestion: Ingestion? = nil
+        var ingestionError: String? = nil
 
         var total: Int64 { files.reduce(0) { $0 + max($1.size, $1.received) } }
         var received: Int64 { files.reduce(0) { $0 + ($1.done ? max($1.size, $1.received) : $1.received) } }
         var filesDone: Int { files.filter(\.done).count }
         var failed: Bool { files.contains { $0.error != nil } }
         var complete: Bool { files.allSatisfy(\.done) }
+        var isLibraryArtifact: Bool { kind == .apk || kind == .bundle }
     }
 
     @Published private(set) var jobs: [Job] = []
@@ -106,6 +133,7 @@ final class Downloads: ObservableObject {
             MainActor.assumeIsolated { Downloads.shared.returned() }
         }
         settleFromDisk()
+        recoverIncomingAPKs()
         adoptBackgroundTasks()
     }
 
@@ -131,9 +159,42 @@ final class Downloads: ObservableObject {
             start(Job(title: manifest.name.isEmpty ? (url.host ?? "Folder") : manifest.name, source: url.absoluteString, kind: .folder, files: files))
             return
         }
-        let (name, size) = await Self.probe(url)
-        let kind: Job.Kind = name.lowercased().hasSuffix(".apk") ? .apk : .file
+        let (suggestedName, size) = await Self.probe(url)
+        let suggestedExtension = (suggestedName as NSString).pathExtension.lowercased()
+        let urlExtension = url.pathExtension.lowercased()
+        let supportedExtensions = BundleUnpacker.extensions.union(["apk"])
+        let artifactExtension = supportedExtensions.contains(suggestedExtension) ? suggestedExtension
+            : supportedExtensions.contains(urlExtension) ? urlExtension : nil
+        let name = artifactExtension.map { ext in
+            suggestedExtension == ext ? suggestedName : "\((suggestedName as NSString).deletingPathExtension).\(ext)"
+        } ?? suggestedName
+        let kind: Job.Kind
+        if artifactExtension == "apk" { kind = .apk }
+        else if let ext = artifactExtension, BundleUnpacker.extensions.contains(ext) { kind = .bundle }
+        else { kind = .file }
         start(Job(title: name, source: url.absoluteString, kind: kind, files: [File(path: name, url: url.absoluteString, size: size)]))
+    }
+
+    /// Download a repository APK or bundle through the same resumable, checksum-verified library-ingest path.
+    func addRepositoryArtifact(title: String, urlString: String, filename: String, size: Int64, sha256: String?, kind: Job.Kind) {
+        problem = nil
+        guard let url = URL(string: urlString), ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+            problem = "The repository provided an invalid download URL."
+            return
+        }
+        let ext = (filename as NSString).pathExtension.lowercased()
+        let validExtension = kind == .apk ? ext == "apk" : kind == .bundle && BundleUnpacker.extensions.contains(ext)
+        guard !filename.isEmpty, filename == (filename as NSString).lastPathComponent,
+              !filename.contains("\\"), filename != ".", filename != "..", validExtension else {
+            problem = "The repository provided an invalid APK or bundle filename."
+            return
+        }
+        if let sha256, sha256.range(of: "^[0-9a-fA-F]{64}$", options: .regularExpression) == nil {
+            problem = "The repository provided an invalid SHA-256 checksum."
+            return
+        }
+        let file = File(path: filename, url: url.absoluteString, size: max(0, size), sha256: sha256?.lowercased())
+        start(Job(title: title, source: url.absoluteString, kind: kind, files: [file]))
     }
 
     private func start(_ new: Job) {
@@ -145,10 +206,20 @@ final class Downloads: ObservableObject {
                 var merged = new
                 merged.id = existing.id
                 merged.added = existing.added
+                let sameArtifact = existing.kind == new.kind && existing.isLibraryArtifact && new.isLibraryArtifact &&
+                    existing.files.count == new.files.count && new.files.allSatisfy { file in
+                        existing.files.contains { $0.path == file.path && $0.size == file.size && $0.sha256 == file.sha256 }
+                    }
                 for k in merged.files.indices {
-                    if let old = existing.files.first(where: { $0.path == merged.files[k].path }), old.size == merged.files[k].size {
+                    if let old = existing.files.first(where: { $0.path == merged.files[k].path }),
+                       old.size == merged.files[k].size, old.sha256 == merged.files[k].sha256 {
                         merged.files[k].done = old.done
                     }
+                }
+                if sameArtifact {
+                    merged.finished = existing.finished
+                    merged.ingestion = existing.ingestion
+                    merged.ingestionError = existing.ingestionError
                 }
                 jobs[i] = merged
             }
@@ -209,8 +280,40 @@ final class Downloads: ObservableObject {
     }
 
     func clearFinished() {
-        jobs.removeAll { $0.complete }
+        jobs.removeAll { $0.complete && $0.ingestion != .adding }
         save()
+    }
+
+    func retryIngestion(_ id: UUID) {
+        guard let j = jobs.firstIndex(where: { $0.id == id }), jobs[j].complete,
+              jobs[j].isLibraryArtifact, jobs[j].ingestion == .failed || jobs[j].ingestion == .interrupted,
+              let file = jobs[j].files.first,
+              let dest = Self.destination(jobs[j].kind, file.path) else { return }
+        guard FileManager.default.fileExists(atPath: dest.path) else {
+            jobs[j].ingestion = .interrupted
+            jobs[j].ingestionError = "The downloaded file is no longer available to retry. Check the library."
+            save()
+            return
+        }
+        beginIngestion(id, path: file.path, from: dest)
+    }
+
+    private func beginIngestion(_ id: UUID, path: String, from url: URL) {
+        guard let j = jobs.firstIndex(where: { $0.id == id }), jobs[j].files.contains(where: { $0.path == path }) else { return }
+        jobs[j].ingestion = .adding
+        jobs[j].ingestionError = nil
+        save()
+        TranslationLayerStore.shared.add([url], move: true) { [weak self] failure in
+            self?.ingestionFinished(id, path: path, failure: failure)
+        }
+    }
+
+    private func ingestionFinished(_ id: UUID, path: String, failure: String?) {
+        guard let j = jobs.firstIndex(where: { $0.id == id }), let i = jobs[j].files.firstIndex(where: { $0.path == path }) else { return }
+        jobs[j].ingestion = failure == nil ? .added : .failed
+        jobs[j].ingestionError = failure
+        save()
+        LiveDownload.update(jobs: jobs, speed: speed)
     }
 
     // MARK: moving bytes
@@ -333,7 +436,7 @@ final class Downloads: ObservableObject {
     fileprivate func progressed(_ tag: TaskTag, received: Int64, expected: Int64) {
         guard let j = jobs.firstIndex(where: { $0.id == tag.job }), let k = jobs[j].files.firstIndex(where: { $0.path == tag.path }) else { return }
         jobs[j].files[k].received = received
-        if expected > 0 { jobs[j].files[k].size = expected }
+        if expected > 0, jobs[j].files[k].size == 0 { jobs[j].files[k].size = expected }
         let now = Date(), all = jobs.reduce(0) { $0 + $1.received }
         let dt = now.timeIntervalSince(lastSample.time)
         if dt >= 1 {
@@ -346,14 +449,20 @@ final class Downloads: ObservableObject {
     }
 
     /// One file's transfer ended: complete, or stopped part-way (its bytes stay in the .part for next time).
-    fileprivate func ended(_ tag: TaskTag, error: String?, cancelled: Bool = false, background: Bool = false) {
+    fileprivate func ended(_ tag: TaskTag, error: String?, cancelled: Bool = false, background: Bool = false, expectedSize: Int64? = nil) {
         let k = key(tag.job, tag.path)
         if background { handedOff.remove(k) } else { directRunning[k] = nil }
         guard let j = jobs.firstIndex(where: { $0.id == tag.job }), let i = jobs[j].files.firstIndex(where: { $0.path == tag.path }) else { pump(); return }
+        let declaredSize = jobs[j].files[i].size
+        let expectedSizeMismatch = expectedSize.map { $0 > 0 && declaredSize > 0 && $0 != declaredSize } ?? false
+        if let expectedSize, expectedSize > 0, declaredSize == 0 { jobs[j].files[i].size = expectedSize }
         let f = jobs[j].files[i]
         if f.done { pump(); return }      // a second transfer of a file that is already in place
         guard let dest = Self.destination(tag.kind, f.path) else { return }
-        let part = Self.partURL(dest), have = Self.size(part)
+        let part = Self.partURL(dest)
+        if expectedSizeMismatch { try? FileManager.default.removeItem(at: part) }
+        let have = Self.size(part)
+        let transferError = error ?? (expectedSizeMismatch ? "the server's reported total did not match the declared file size" : nil)
         jobs[j].files[i].received = have
         if f.size > 0, have > f.size {
             // Longer than the file: something wrote twice. Start that file again rather than keep it.
@@ -364,7 +473,27 @@ final class Downloads: ObservableObject {
             pump()
             return
         }
-        if error == nil, f.size == 0 || have == f.size {
+        if transferError == nil, !cancelled, f.size == 0 || have == f.size {
+            if let expected = f.sha256 {
+                guard let actual = Self.sha256(part) else {
+                    try? FileManager.default.removeItem(at: part)
+                    jobs[j].files[i].received = 0
+                    jobs[j].files[i].error = "Could not read the completed APK to verify its SHA-256."
+                    save()
+                    pump()
+                    return
+                }
+                guard actual == expected else {
+                    try? FileManager.default.removeItem(at: part)
+                    jobs[j].files[i].received = 0
+                    jobs[j].files[i].error = "SHA-256 mismatch; the repository APK was discarded."
+                    HuskLog.log("downloads", "\(f.path): SHA-256 verification failed")
+                    save()
+                    pump()
+                    return
+                }
+                HuskLog.log("downloads", "\(f.path): repository SHA-256 verified")
+            }
             // All of it: into place.
             let fm = FileManager.default
             try? fm.removeItem(at: dest)
@@ -376,7 +505,7 @@ final class Downloads: ObservableObject {
                 if f.size == 0 { jobs[j].files[i].size = jobs[j].files[i].received }
                 retries[k] = nil
                 HuskLog.log("downloads", "\(f.path) done (\(jobs[j].filesDone)/\(jobs[j].files.count))")
-                if tag.kind == .apk { TranslationLayerStore.shared.add([dest], move: true) }
+                if tag.kind == .apk || tag.kind == .bundle { beginIngestion(tag.job, path: f.path, from: dest) }
             } catch {
                 jobs[j].files[i].error = error.localizedDescription
             }
@@ -387,13 +516,13 @@ final class Downloads: ObservableObject {
             retries[k] = n
             if n <= 5 {
                 let wait: UInt64 = [2, 5, 15, 30, 60][n - 1]
-                HuskLog.log("downloads", "\(f.path): \(error ?? "incomplete") at \(Self.bytes(have)); again in \(wait) s")
+                HuskLog.log("downloads", "\(f.path): \(transferError ?? "incomplete") at \(Self.bytes(have)); again in \(wait) s")
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: wait * 1_000_000_000)
                     self.pump()
                 }
             } else {
-                jobs[j].files[i].error = error ?? "the transfer kept stopping"
+                jobs[j].files[i].error = transferError ?? "the transfer kept stopping"
                 HuskLog.log("downloads", "\(f.path): giving up after \(n - 1) tries")
             }
         }
@@ -415,14 +544,21 @@ final class Downloads: ObservableObject {
 
     // MARK: on disk
 
-    /// Files already in place at their full size are done; partly fetched ones count what their .part holds.
+    /// Files already in place are done if their declared size matches (or is unknown); partly fetched ones count their .part.
     private static func settle(_ job: inout Job) {
         for i in job.files.indices where !job.files[i].done {
             guard let dest = destination(job.kind, job.files[i].path) else { continue }
             let full = size(dest)
-            if full > 0, job.files[i].size > 0, full == job.files[i].size, !FileManager.default.fileExists(atPath: partURL(dest).path) {
-                job.files[i].done = true
-                job.files[i].received = full
+            if full > 0, (job.files[i].size == 0 || full == job.files[i].size), !FileManager.default.fileExists(atPath: partURL(dest).path) {
+                if let expected = job.files[i].sha256, Self.sha256(dest) != expected {
+                    try? FileManager.default.removeItem(at: dest)
+                    job.files[i].received = 0
+                    job.files[i].error = "SHA-256 mismatch; the repository APK was discarded."
+                } else {
+                    job.files[i].done = true
+                    job.files[i].received = full
+                    if job.files[i].size == 0 { job.files[i].size = full }
+                }
             } else {
                 job.files[i].received = size(partURL(dest))
             }
@@ -431,6 +567,37 @@ final class Downloads: ObservableObject {
 
     private func settleFromDisk() {
         for j in jobs.indices { Self.settle(&jobs[j]) }
+        save()
+    }
+
+    /// A completed artifact may still be waiting here if Husk was terminated before library ingestion finished.
+    private func recoverIncomingAPKs() {
+        let dir = Self.stateDir.appendingPathComponent("incoming", isDirectory: true)
+        let files = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil,
+                                                                    options: [.skipsHiddenFiles])) ?? [])
+            .filter { $0.pathExtension.lowercased() == "apk" || BundleUnpacker.extensions.contains($0.pathExtension.lowercased()) }
+            .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+        var scheduled = Set<UUID>()
+        for file in files {
+            let match = jobs.firstIndex { job in
+                job.isLibraryArtifact && job.files.contains { item in
+                    Self.destination(job.kind, item.path)?.standardizedFileURL == file.standardizedFileURL
+                }
+            }
+            guard let j = match else {
+                TranslationLayerStore.shared.add([file], move: true)
+                continue
+            }
+            guard jobs[j].ingestion != .added else { continue }
+            let id = jobs[j].id
+            guard let item = jobs[j].files.first(where: { Self.destination(jobs[j].kind, $0.path)?.standardizedFileURL == file.standardizedFileURL }) else { continue }
+            scheduled.insert(id)
+            beginIngestion(id, path: item.path, from: file)
+        }
+        for j in jobs.indices where jobs[j].ingestion == .adding && !scheduled.contains(jobs[j].id) {
+            jobs[j].ingestion = .interrupted
+            jobs[j].ingestionError = "Husk stopped before it could confirm whether this download was added. Check the library."
+        }
         save()
     }
 
@@ -457,7 +624,7 @@ final class Downloads: ObservableObject {
     nonisolated static func destination(_ kind: Job.Kind, _ path: String) -> URL? {
         let parts = path.split(separator: "/").map(String.init)
         guard !parts.isEmpty, !parts.contains(".."), !parts.contains(".") else { return nil }
-        if kind == .apk { return stateDir.appendingPathComponent("incoming", isDirectory: true).appendingPathComponent(parts.last!) }
+        if kind == .apk || kind == .bundle { return stateDir.appendingPathComponent("incoming", isDirectory: true).appendingPathComponent(parts.last!) }
         return parts.reduce(TranslationLayer.sharedStorage) { $0.appendingPathComponent($1) }
     }
 
@@ -503,6 +670,18 @@ final class Downloads: ObservableObject {
     }
 
     static func bytes(_ n: Int64) -> String { ByteCountFormatter.string(fromByteCount: n, countStyle: .file) }
+
+    nonisolated private static func sha256(_ url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        do {
+            while let data = try handle.read(upToCount: 8 << 20), !data.isEmpty { hasher.update(data: data) }
+            return hasher.finalize().map { String(format: "%02x", Int($0)) }.joined()
+        } catch {
+            return nil
+        }
+    }
 
     // MARK: iOS 26
 
@@ -551,6 +730,7 @@ final class DirectDownloadDelegate: NSObject, URLSessionDataDelegate {
         var handle: FileHandle?
         var written: Int64
         var expected: Int64 = 0
+        var expectedRangeLength: Int64?
         var lastReport = Date.distantPast
         var error: String?
         init(tag: TaskTag, part: URL, offset: Int64) { self.tag = tag; self.part = part; written = offset }
@@ -571,19 +751,28 @@ final class DirectDownloadDelegate: NSObject, URLSessionDataDelegate {
         guard let h = try? FileHandle(forWritingTo: t.part) else { t.error = "cannot write the file"; completionHandler(.cancel); return }
         switch http.statusCode {
         case 206:
-            // The rest, from where the .part ends.
+            guard let range = downloadContentRange(http.value(forHTTPHeaderField: "Content-Range"), t.tag.offset) else {
+                t.error = "the server returned an invalid byte range"
+                try? h.close()
+                try? fm.removeItem(at: t.part)
+                completionHandler(.cancel)
+                return
+            }
+            // The rest, from where the .part ends. A numeric total is needed to tell when all bytes arrived.
             try? h.truncate(atOffset: UInt64(t.tag.offset))
             t.written = t.tag.offset
-            t.expected = t.tag.offset + max(0, http.expectedContentLength)
+            t.expected = range.total
+            t.expectedRangeLength = range.bodyLength
         case 200:
             // The whole file (no Range asked, or the server ignores it): from the start.
             try? h.truncate(atOffset: 0)
             t.written = 0
             t.expected = max(0, http.expectedContentLength)
         case 416:
-            // Nothing left to send: the .part is already whole.
-            t.expected = t.written
+            // A stale offset must not make an unknown-length, partial file look complete. Drop it and retry from byte zero.
+            t.error = "the server rejected the resume request"
             try? h.close()
+            try? fm.removeItem(at: t.part)
             completionHandler(.cancel)
             return
         default:
@@ -614,12 +803,21 @@ final class DirectDownloadDelegate: NSObject, URLSessionDataDelegate {
         guard let t else { return }
         try? t.handle?.synchronize()
         try? t.handle?.close()
+        let receivedBody = t.written - t.tag.offset
+        if let expected = t.expectedRangeLength, receivedBody > expected || (error == nil && receivedBody < expected) {
+            t.error = "the response body did not match its byte range"
+            if receivedBody > expected { try? FileManager.default.removeItem(at: t.part) }
+        }
         let ns = error as NSError?
         let cancelled = ns?.code == NSURLErrorCancelled && t.error == nil
         let message = t.error ?? (cancelled ? nil : error?.localizedDescription)
         let incomplete = t.expected > 0 && t.written < t.expected
         let tag = t.tag
-        Task { @MainActor in Downloads.shared.ended(tag, error: message ?? (incomplete && !cancelled ? "the connection ended early" : nil), cancelled: cancelled) }
+        let expectedSize = t.expected > 0 ? t.expected : nil
+        Task { @MainActor in
+            Downloads.shared.ended(tag, error: message ?? (incomplete && !cancelled ? "the connection ended early" : nil),
+                                   cancelled: cancelled, expectedSize: expectedSize)
+        }
     }
 }
 
@@ -628,20 +826,48 @@ final class DirectDownloadDelegate: NSObject, URLSessionDataDelegate {
 final class BackgroundDownloadDelegate: NSObject, URLSessionDownloadDelegate {
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData _: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         guard let tag = TaskTag(downloadTask.taskDescription) else { return }
-        let received = tag.offset + totalBytesWritten, expected = totalBytesExpectedToWrite > 0 ? tag.offset + totalBytesExpectedToWrite : 0
+        let response = downloadTask.response as? HTTPURLResponse
+        let isPartial = response?.statusCode == 206
+        let (received, overflow) = (isPartial ? tag.offset : 0).addingReportingOverflow(totalBytesWritten)
+        guard !overflow else { return }
+        let expected: Int64
+        if isPartial {
+            expected = downloadContentRange(response?.value(forHTTPHeaderField: "Content-Range"), tag.offset)?.total ?? 0
+        } else if response?.statusCode == 200, totalBytesExpectedToWrite > 0 {
+            expected = totalBytesExpectedToWrite
+        } else {
+            expected = 0
+        }
         Task { @MainActor in Downloads.shared.progressed(tag, received: received, expected: expected) }
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         guard let tag = TaskTag(downloadTask.taskDescription), let dest = Downloads.destination(tag.kind, tag.path) else { return }
         let part = Downloads.partURL(dest)
-        let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
+        let response = downloadTask.response as? HTTPURLResponse
+        let status = response?.statusCode ?? 0
+        let range = status == 206 ? downloadContentRange(response?.value(forHTTPHeaderField: "Content-Range"), tag.offset) : nil
         let fm = FileManager.default
+        var rangeBodyIncomplete = false
         do {
             try fm.createDirectory(at: part.deletingLastPathComponent(), withIntermediateDirectories: true)
             if status == 416 {
-                // Nothing was left to send: the .part is already whole.
-            } else if status == 206, tag.offset > 0, Downloads.size(part) >= tag.offset {
+                try? fm.removeItem(at: part)
+                throw NSError(domain: "HuskDownloads", code: status, userInfo: [NSLocalizedDescriptionKey: "the server rejected the resume request"])
+            }
+            if status == 206 {
+                guard let range else {
+                    try? fm.removeItem(at: part)
+                    throw NSError(domain: "HuskDownloads", code: status, userInfo: [NSLocalizedDescriptionKey: "the server returned an invalid byte range"])
+                }
+                let bodySize = Downloads.size(location)
+                guard bodySize <= range.bodyLength else {
+                    try? fm.removeItem(at: part)
+                    throw NSError(domain: "HuskDownloads", code: status, userInfo: [NSLocalizedDescriptionKey: "the response body did not match its byte range"])
+                }
+                rangeBodyIncomplete = bodySize < range.bodyLength
+            }
+            if status == 206, tag.offset > 0, Downloads.size(part) >= tag.offset {
                 // Append the rest to what was there. The .part can be a little longer than when the request was made (Husk's own
                 // transfer was still writing as it was stopped); the response is exactly the bytes from the offset, so cut it back first.
                 guard let out = try? FileHandle(forWritingTo: part), let inp = try? FileHandle(forReadingFrom: location) else { throw CocoaError(.fileWriteUnknown) }
@@ -657,19 +883,24 @@ final class BackgroundDownloadDelegate: NSObject, URLSessionDownloadDelegate {
             }
         } catch {
             let message = error.localizedDescription
-            Task { @MainActor in Downloads.shared.ended(tag, error: message, background: true) }
+            Task { @MainActor in Downloads.shared.ended(tag, error: message, background: true, expectedSize: range?.total) }
             return
         }
-        Task { @MainActor in Downloads.shared.ended(tag, error: nil, background: true) }
+        let message = rangeBodyIncomplete ? "the response body did not match its byte range" : nil
+        Task { @MainActor in Downloads.shared.ended(tag, error: message, background: true, expectedSize: range?.total) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let error, let tag = TaskTag(task.taskDescription) else { return }
         let ns = error as NSError
         let cancelled = ns.code == NSURLErrorCancelled
+        let response = task.response as? HTTPURLResponse
+        let expectedSize = response.flatMap {
+            $0.statusCode == 206 ? downloadContentRange($0.value(forHTTPHeaderField: "Content-Range"), tag.offset)?.total : nil
+        }
         // The bytes it had are lost with it (they are in iOS's own file, not the .part); the next try starts where the .part ends.
         let message = error.localizedDescription
-        Task { @MainActor in Downloads.shared.ended(tag, error: message, cancelled: cancelled, background: true) }
+        Task { @MainActor in Downloads.shared.ended(tag, error: message, cancelled: cancelled, background: true, expectedSize: expectedSize) }
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
