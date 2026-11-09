@@ -1000,13 +1000,19 @@ static const char *intent_extra(const char *key)
     for (int i = 0; i < g_nextras; i++) if (!strcmp(g_extras[i].key, key)) return g_extras[i].val;
     return NULL;
 }
+static const char *intent_extra_read(const char *key, const char *accessor)
+{
+    const char *v = intent_extra(key);
+    if (!strcmp(key, "unity")) tl_log_line("unity: launch command line extra read via %s -> %s", accessor, v ? v : "(missing)");
+    return v;
+}
 static void Intent_getExtras(tl_jcall *c) { c->ret = vl(g_nextras ? make("android/os/Bundle") : NULL); }
-static void Intent_getStringExtra(tl_jcall *c) { const char *v = intent_extra(S(c->args[0].l)); c->ret = vl(v ? STR(v) : NULL); }
+static void Intent_getStringExtra(tl_jcall *c) { const char *v = intent_extra_read(S(c->args[0].l), "Intent.getStringExtra"); c->ret = vl(v ? STR(v) : NULL); }
 static void Bundle_containsKey(tl_jcall *c) { c->ret = vz(intent_extra(S(c->args[0].l)) != NULL); }
-static void Bundle_getString(tl_jcall *c) { const char *v = intent_extra(S(c->args[0].l)); c->ret = vl(v ? STR(v) : NULL); }
+static void Bundle_getString(tl_jcall *c) { const char *v = intent_extra_read(S(c->args[0].l), "Bundle.getString"); c->ret = vl(v ? STR(v) : NULL); }
 static void Bundle_getString_or(tl_jcall *c)
 {
-    const char *v = intent_extra(S(c->args[0].l));
+    const char *v = intent_extra_read(S(c->args[0].l), "Bundle.getString(default)");
     c->ret = vl(v ? STR(v) : c->args[1].l ? tl_jni_ref(c->args[1].l) : NULL);
 }
 static void Intent_init_action(tl_jcall *c) { tl_jni_set_field(c->self, "action", "Ljava/lang/String;", vl(c->args[0].l)); }

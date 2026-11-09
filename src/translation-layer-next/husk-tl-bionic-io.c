@@ -9,6 +9,7 @@
  */
 #define _DARWIN_C_SOURCE
 #include "husk-tl-bionic.h"
+#include "husk-tl-memory-policy.h"
 const char *tl_ld_main_apk(void);
 bool tl_ld_aot_contains(const void *addr);
 bool tl_ld_covers(const void *addr, size_t bytes);
@@ -1470,7 +1471,7 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
     void *r = refuse || (force_phantom && compressed_heap_request(len) && prot == 0 && (flags & 0x20) && !(flags & 0x10)) ? MAP_FAILED
             : shifted ? shifted_file_map(addr, len, prot_filter(prot, "mmap"), df, fd, off)
             : mmap(addr, len, prot_filter(prot, "mmap"), df, (flags & 0x20) ? -1 : fd, off);
-    if (r == MAP_FAILED && (errno == ENOMEM || force_phantom) && prot == 0 && (flags & 0x20) && !(flags & 0x10)) { r = phantom_reserve(len); if (r != MAP_FAILED) errno = 0; }
+    r = tl_mm_retry_phantom_reservation(r, len, prot, flags, force_phantom, phantom_reserve);
     TL_ERRNO_END();
     /* a file mapped executable (libffi's trampolines: its own library's code page, or a temporary file holding a copy): a phone
        can not make file pages executable, and a library's file offsets are not where the loader put its code, so the mapping

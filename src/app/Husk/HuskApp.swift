@@ -55,7 +55,11 @@ enum HuskOrientation {
 
 final class HuskAppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
-        HuskOrientation.mask
+        let supported = HuskOrientation.mask
+        let root = window?.rootViewController.map { "\(type(of: $0))=\($0.supportedInterfaceOrientations.rawValue)" } ?? "none"
+        let scene = window?.windowScene.map { String(describing: $0.activationState) } ?? "none"
+        HuskLog.log("ui", "orientation delegate: mask=\(supported.rawValue) scene=\(scene) root=\(root)")
+        return supported
     }
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {

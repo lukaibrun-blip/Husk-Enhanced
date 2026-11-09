@@ -60,6 +60,12 @@ else
     step "optional PS4 layer omitted (separate Bachata-S4 and FEXCore checkouts not present)"
 fi
 
+step "translation-layer memory policy tests"
+TL_POLICY_TEST="$HUSK_ROOT/scripts/tests/translation_layer_memory_policy.c"
+TL_POLICY_BIN="${RUNNER_TEMP:-/tmp}/husk-tl-memory-policy-tests"
+clang -std=c11 -Wall -Wextra -Werror -I "$HUSK_ROOT/src/translation-layer-next" "$TL_POLICY_TEST" -o "$TL_POLICY_BIN"
+"$TL_POLICY_BIN"
+
 step "download and bundle-ingestion unit tests"
 (cd "$HUSK_ROOT/src/app" && xcodegen generate --quiet)
 xcodebuild -project "$HUSK_ROOT/src/app/Husk.xcodeproj" \

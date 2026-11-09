@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #define _DARWIN_C_SOURCE
 #include "husk-tl-unity.h"
+#include "husk-tl-memory-policy.h"
 
 #include <pthread.h>
 #include <setjmp.h>
@@ -178,10 +179,11 @@ static void *native_of(const char *cls, const char *name, const char *sig)
 static void set_command_line(void)
 {
     const char *force = getenv("TL_UNITY_SYSTEM_ALLOCATOR");
-    bool sys = force ? atoi(force) != 0 : tl_mm_address_space_short();
+    const char *extra = getenv("TL_UNITY_ARGS");
+    bool short_address_space = force ? false : tl_mm_address_space_short();
+    bool sys = tl_unity_system_allocator_enabled(force, short_address_space);
     char line[512];
-    snprintf(line, sizeof(line), "%s%s%s", sys ? "-systemallocator" : "", sys && getenv("TL_UNITY_ARGS") ? " " : "",
-             getenv("TL_UNITY_ARGS") ? getenv("TL_UNITY_ARGS") : "");
+    tl_unity_format_command_line(line, sizeof(line), sys, extra);
     if (!line[0]) return;
     tl_hle_set_intent_extra("unity", line);
     tl_log_line("unity: command line \"%s\"%s", line, sys ? " (malloc for the engine's memory: Unity's own allocators reserve more address space than there is)" : "");
