@@ -233,10 +233,11 @@ final class EspacioAPKCatalog: ObservableObject {
         categoriesError = nil
         defer { isLoadingCategories = false }
         do {
-            categories = try await Self.get([EspacioAPKCategory].self, resource: "categories", query: [
+            let (loadedCategories, _) = try await Self.get([EspacioAPKCategory].self, resource: "categories", query: [
                 URLQueryItem(name: "per_page", value: "100"),
                 URLQueryItem(name: "hide_empty", value: "true")
-            ]).filter { !EspacioAPKPolicy.containsRestrictedGamblingContent($0.name) }
+            ])
+            categories = loadedCategories.filter { !EspacioAPKPolicy.containsRestrictedGamblingContent($0.name) }
             categoriesLoaded = true
         } catch {
             categoriesError = error.localizedDescription
@@ -299,7 +300,7 @@ final class EspacioAPKCatalog: ObservableObject {
         return Page(posts: posts, totalPages: max(1, pages))
     }
 
-    private static func get<T: Decodable>(_ type: T.Type, resource: String, query: [URLQueryItem]) async throws -> T {
+    private static func get<T: Decodable>(_ type: T.Type, resource: String, query: [URLQueryItem]) async throws -> (T, HTTPURLResponse) {
         guard resource == "posts" || resource == "categories" else { throw EspacioAPKError.invalidEndpoint }
         var components = URLComponents()
         components.scheme = "https"
@@ -311,7 +312,7 @@ final class EspacioAPKCatalog: ObservableObject {
         }
         var request = URLRequest(url: url)
         request.timeoutInterval = 30
-        let (data, _) = try await EspacioAPKResponseLoader(limit: responseLimit).load(request)
-        return try JSONDecoder().decode(type, from: data)
+        let (data, response) = try await EspacioAPKResponseLoader(limit: responseLimit).load(request)
+        return (try JSONDecoder().decode(type, from: data), response)
     }
 }
