@@ -61,5 +61,6 @@ jobs:
           path: |
             build/logs/**/*.log
             ${{ runner.temp }}/husk-derived-data/build.log
+            ${{ runner.temp }}/husk-range-tests/Logs/Test/*.xcresult
           if-no-files-found: ignore
           retention-days: 7

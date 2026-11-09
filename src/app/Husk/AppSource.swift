@@ -87,7 +87,7 @@ enum EspacioAPKPolicy {
     ]
 
     private static let modifiedPatterns = [
-        #"\bmod(s|ded)?\b"#, #"\bmodified\b"#, #"\bmodificado(s)?\b"#,
+        #"\bmod(s|ded)?\b"#, #"\bmodified\b"#, #"\bmodificad[oa]s?\b"#,
         #"\bhack(ed|s)?\b"#, #"\bunlocked\b"#, #"\bpremium apk\b"#,
         #"\bcheat(s)?\b"#, #"\bmod menu\b"#
     ]

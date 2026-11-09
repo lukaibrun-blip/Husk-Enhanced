@@ -39,6 +39,8 @@ final class EspacioAPKPolicyTests: XCTestCase {
     func testModifiedContentClaimsAreExplicitlyMarked() {
         XCTAssertTrue(EspacioAPKPolicy.claimsModifiedContent("Among Us MOD menu"))
         XCTAssertTrue(EspacioAPKPolicy.claimsModifiedContent("Versión modificada"))
+        XCTAssertTrue(EspacioAPKPolicy.claimsModifiedContent("Juego modificado"))
+        XCTAssertTrue(EspacioAPKPolicy.claimsModifiedContent("Aplicaciones modificadas"))
         XCTAssertFalse(EspacioAPKPolicy.claimsModifiedContent("Among Us official listing"))
     }
 }
