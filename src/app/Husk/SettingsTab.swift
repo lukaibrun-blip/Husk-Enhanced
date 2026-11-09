@@ -29,7 +29,7 @@ struct SettingsTab: View {
                 }
 
                 Section("General") {
-                    row(DiscoverView(), "sparkle.magnifyingglass", .mint, "Discover", "Find apps in F-Droid and other repositories")
+                    row(EspacioAPKView(navigationTitle: "EspacioAPK"), "sparkle.magnifyingglass", .mint, "EspacioAPK", "Browse app listings safely")
                     row(LibrarySettings(), "square.grid.2x2.fill", .blue, "Library", "Your apps and their icons")
                     row(PerformanceSettings(), "speedometer", .orange, "Performance", "Renderer, sound")
                     row(AppearanceSettings(), "paintbrush.fill", .pink, "Appearance", "Light or dark, accent colour, app icon")

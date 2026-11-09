@@ -86,7 +86,7 @@ struct StoreView: View {
                 GoogleSignInSheet()
             }
             .sheet(isPresented: $showAPKStore) {
-                NavigationStack { DiscoverView() }
+                NavigationStack { EspacioAPKView() }
             }
             .onReceive(Router.shared.$storePackage) { pkg in
                 guard let pkg else { return }

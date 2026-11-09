@@ -65,7 +65,7 @@ struct ContentView: View {
                     .tag(HuskTab.store)
 
                 NavigationStack {
-                    DiscoverView(navigationTitle: "APK Store")
+                    EspacioAPKView(navigationTitle: "APK Store")
                 }
                 .tabItem { Label("APK Store", systemImage: "shippingbox.fill") }
                 .tag(HuskTab.apkStore)
