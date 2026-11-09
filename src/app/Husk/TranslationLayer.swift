@@ -168,6 +168,11 @@ struct TLApp: Identifiable {
     var isGameCategory: Bool { apks.first.map { husk_apk_is_game($0) != 0 } ?? false }
 }
 
+private struct TLIngestResult: Sendable {
+    let failure: String?
+    let appIDs: [String]
+}
+
 // MARK: - Store
 
 /// The apps added for the translation layer, and the phone's answers.
@@ -278,11 +283,16 @@ final class TranslationLayerStore: ObservableObject {
     /// One app's APKs (a base and its splits, or a bundle) copied in (the originals stay where they are), and the new app's folder name: the developer mass test takes its APKs
     /// from a folder of the user's this way, one per launch of Husk.
     nonisolated static func importCopy(_ urls: [URL]) -> String? {
-        let fm = FileManager.default
-        let before = Set((try? fm.contentsOfDirectory(atPath: TranslationLayer.root.path)) ?? [])
-        guard !urls.isEmpty, ingest(urls, move: false) == nil else { return nil }
-        let after = Set((try? fm.contentsOfDirectory(atPath: TranslationLayer.root.path)) ?? [])
-        return after.subtracting(before).first
+        guard !urls.isEmpty else { return nil }
+        let result = ingest(urls, move: false)
+        guard result.failure == nil else { return nil }
+        guard result.appIDs.count == 1 else {
+            for id in result.appIDs {
+                try? FileManager.default.removeItem(at: TranslationLayer.root.appendingPathComponent(id, isDirectory: true))
+            }
+            return nil
+        }
+        return result.appIDs[0]
     }
 
     func add(_ urls: [URL], move: Bool = false, completion: (@MainActor (String?) -> Void)? = nil) {
@@ -298,13 +308,13 @@ final class TranslationLayerStore: ObservableObject {
         busy = urls.count == 1 ? "Adding \(urls[0].lastPathComponent)…"
                                : "Adding \(urls.count) APKs…"
         Task.detached(priority: .userInitiated) {
-            let failure = Self.ingest(urls, move: move)
+            let result = Self.ingest(urls, move: move)
             await MainActor.run {
                 self.busy = nil
-                self.lastError = failure
+                self.lastError = result.failure
                 self.reload()
-                completion?(failure)
-                if failure == nil, move { self.adoptDroppedAfterIngest = true }
+                completion?(result.failure)
+                if result.failure == nil, move { self.adoptDroppedAfterIngest = true }
                 self.startNextIngest()
                 if self.busy == nil, self.pendingIngests.isEmpty, self.adoptDroppedAfterIngest {
                     self.adoptDroppedAfterIngest = false
@@ -385,59 +395,159 @@ final class TranslationLayerStore: ObservableObject {
                         .trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    /// Copy, name, scan. Returns what went wrong, if anything did.
-    nonisolated private static func ingest(_ urls: [URL], move: Bool = false) -> String? {
+    /// Copy, group by manifest package, name, scan. Returns what went wrong, if anything did.
+    nonisolated private static func ingest(_ urls: [URL], move: Bool = false) -> TLIngestResult {
         let fm = FileManager.default
-        let dir = TranslationLayer.root.appendingPathComponent(UUID().uuidString,
-                                                               isDirectory: true)
+        let root = TranslationLayer.root
+        let stagingRoot = root.appendingPathComponent(".ingest-\(UUID().uuidString)", isDirectory: true)
+        var stagedDirectories: [URL] = []
+        var finalDirectories: [URL?] = []
+        var movedInputs: [(url: URL, group: Int, relativePath: String)] = []
+        var bundleInputs: [URL] = []
+
         do {
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            var entries: [APKIngestPlan.Entry] = []
             for url in urls {
-                // Security-scoped: the picker's URL is only readable inside this pair.
                 let scoped = url.startAccessingSecurityScopedResource()
                 defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                // A bundle (.xapk, .apkm, .apks) is a zip of an app's APKs: take them out, and do not keep the bundle itself.
+                let name = url.lastPathComponent
                 if BundleUnpacker.extensions.contains(url.pathExtension.lowercased()) {
-                    let names = try BundleUnpacker.unpack(url, into: dir)
-                    HuskLog.log("tl", "unpacked \(url.lastPathComponent): \(names.joined(separator: ", "))")
-                    if move { try? fm.removeItem(at: url) }
-                    continue
-                }
-                var name = url.lastPathComponent
-                // An expansion file (main.<version>.<package>.obb) goes to obb/ under its own name: the runtime finds it there
-                // when the game asks for Android/obb/<package>/<name>
-                let isOBB = name.lowercased().hasSuffix(".obb")
-                if !isOBB && !name.lowercased().hasSuffix(".apk") { name += ".apk" }
-                if isOBB { try fm.createDirectory(at: dir.appendingPathComponent("obb"), withIntermediateDirectories: true) }
-                let dest = isOBB ? dir.appendingPathComponent("obb").appendingPathComponent(name) : dir.appendingPathComponent(name)
-                if move {
-                    try fm.moveItem(at: url, to: dest)
+                    entries.append(APKIngestPlan.Entry(kind: .bundle, packageName: nil, isSplit: false, name: name))
+                } else if url.pathExtension.lowercased() == "obb" {
+                    entries.append(APKIngestPlan.Entry(kind: .obb, packageName: packageFromOBB(name), isSplit: false, name: name))
                 } else {
-                    // Coordinated, so a file that lives in iCloud and is not on the phone yet is downloaded first
-                    // (a plain copy of it fails, or finds nothing).
+                    var manifest: Data?
                     var coordinationError: NSError?
-                    var copyError: Error?
                     NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { readable in
-                        do { try fm.copyItem(at: readable, to: dest) } catch { copyError = error }
+                        manifest = entry(readable.path, "AndroidManifest.xml", limit: 8 << 20)
                     }
-                    if let failure = coordinationError ?? copyError { throw failure }
+                    if let coordinationError { throw coordinationError }
+                    entries.append(APKIngestPlan.Entry(kind: .apk,
+                                                       packageName: manifest.flatMap { ApkMetadata.packageName($0) },
+                                                       isSplit: manifest.flatMap { ApkMetadata.isSplit($0) } == true,
+                                                       name: name))
                 }
             }
-        } catch {
-            try? fm.removeItem(at: dir)
-            HuskLog.log("tl", "FAILED to add: \(error.localizedDescription)")
-            return "Husk could not copy it: \(error.localizedDescription)"
-        }
 
-        let apks = orderedAPKs(((try? fm.contentsOfDirectory(atPath: dir.path)) ?? [])
-            .filter { $0.lowercased().hasSuffix(".apk") }
-            .map { dir.appendingPathComponent($0).path })
-        describe(apks, into: dir)
-        let json = scan(apks)
-        try? Data(json.utf8).write(to: dir.appendingPathComponent("report.json"))
-        try? "\(scanVersion)".write(to: dir.appendingPathComponent("scan-version.txt"), atomically: true, encoding: .utf8)
-        HuskLog.log("tl", "report for \(dir.lastPathComponent): \(json)")
-        return nil
+            let groups = try APKIngestPlan.groups(for: entries)
+            try fm.createDirectory(at: root, withIntermediateDirectories: true)
+            try fm.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+            stagedDirectories = groups.indices.map { stagingRoot.appendingPathComponent("\($0)", isDirectory: true) }
+            finalDirectories = Array(repeating: nil, count: groups.count)
+
+            for (groupIndex, indexes) in groups.enumerated() {
+                let dir = stagedDirectories[groupIndex]
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                var occupied = Set<String>()
+                for index in indexes {
+                    let url = urls[index]
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                    let entry = entries[index]
+                    if entry.kind == .bundle {
+                        let names = try BundleUnpacker.unpack(url, into: dir)
+                        HuskLog.log("tl", "unpacked \(url.lastPathComponent): \(names.joined(separator: ", "))")
+                        bundleInputs.append(url)
+                        continue
+                    }
+
+                    let isOBB = entry.kind == .obb
+                    var name = url.lastPathComponent
+                    if !isOBB && !name.lowercased().hasSuffix(".apk") { name += ".apk" }
+                    let relativePath: String
+                    if isOBB {
+                        try fm.createDirectory(at: dir.appendingPathComponent("obb", isDirectory: true), withIntermediateDirectories: true)
+                        let obbNames = Set(occupied.filter { $0.hasPrefix("obb/") }.map { String($0.dropFirst(4)) })
+                        let candidate = APKIngestPlan.uniqueName(name, occupied: obbNames)
+                        relativePath = "obb/\(candidate)"
+                    } else {
+                        relativePath = APKIngestPlan.uniqueName(name, occupied: occupied)
+                    }
+                    occupied.insert(relativePath.lowercased())
+                    let dest = dir.appendingPathComponent(relativePath)
+                    if move {
+                        try fm.moveItem(at: url, to: dest)
+                        movedInputs.append((url, groupIndex, relativePath))
+                    } else {
+                        try copyCoordinated(url, to: dest, using: fm)
+                    }
+                }
+
+                let apkPaths = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? [])
+                    .filter { $0.lowercased().hasSuffix(".apk") }
+                let bundleAPKPaths = (try? fm.subpathsOfDirectory(atPath: dir.path)) ?? []
+                guard !apkPaths.isEmpty || bundleAPKPaths.contains(where: { $0.lowercased().hasSuffix(".apk") }) else {
+                    throw APKIngestPlan.Failure.emptyApp
+                }
+            }
+
+            for groupIndex in groups.indices {
+                let destination = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                try fm.moveItem(at: stagedDirectories[groupIndex], to: destination)
+                finalDirectories[groupIndex] = destination
+            }
+
+            if move { for url in bundleInputs { try? fm.removeItem(at: url) } }
+            try? fm.removeItem(at: stagingRoot)
+
+            for dir in finalDirectories.compactMap({ $0 }) {
+                let apks = orderedAPKs(((try? fm.contentsOfDirectory(atPath: dir.path)) ?? [])
+                    .filter { $0.lowercased().hasSuffix(".apk") }
+                    .map { dir.appendingPathComponent($0).path })
+                describe(apks, into: dir)
+                let json = scan(apks)
+                try? Data(json.utf8).write(to: dir.appendingPathComponent("report.json"))
+                try? "\(scanVersion)".write(to: dir.appendingPathComponent("scan-version.txt"), atomically: true, encoding: .utf8)
+                HuskLog.log("tl", "report for \(dir.lastPathComponent): \(json)")
+            }
+            return TLIngestResult(failure: nil, appIDs: finalDirectories.compactMap { $0?.lastPathComponent })
+        } catch {
+            var rollbackFailed = false
+            for groupIndex in finalDirectories.indices.reversed() {
+                guard let final = finalDirectories[groupIndex] else { continue }
+                do { try fm.moveItem(at: final, to: stagedDirectories[groupIndex]) }
+                catch {
+                    rollbackFailed = true
+                    HuskLog.log("tl", "could not roll back app folder \(final.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+            for moved in movedInputs.reversed() {
+                let staged = stagedDirectories[moved.group].appendingPathComponent(moved.relativePath)
+                let final = finalDirectories[moved.group]?.appendingPathComponent(moved.relativePath)
+                let current = fm.fileExists(atPath: staged.path) ? staged : final
+                guard let current, fm.fileExists(atPath: current.path) else { continue }
+                let scoped = moved.url.startAccessingSecurityScopedResource()
+                defer { if scoped { moved.url.stopAccessingSecurityScopedResource() } }
+                do { try fm.moveItem(at: current, to: moved.url) }
+                catch {
+                    rollbackFailed = true
+                    HuskLog.log("tl", "could not restore \(moved.url.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+            if !rollbackFailed { try? fm.removeItem(at: stagingRoot) }
+            HuskLog.log("tl", "FAILED to add: \(error.localizedDescription)")
+            let message = error is APKIngestPlan.Failure ? error.localizedDescription : "Husk could not copy it: \(error.localizedDescription)"
+            return TLIngestResult(failure: message, appIDs: [])
+        }
+    }
+
+    nonisolated private static func packageFromOBB(_ name: String) -> String? {
+        let stem = (name as NSString).deletingPathExtension
+        let components = stem.split(separator: ".")
+        guard components.count >= 3,
+              (components[0].lowercased() == "main" || components[0].lowercased() == "patch"),
+              components[1].allSatisfy({ $0.isNumber }) else { return nil }
+        return components.dropFirst(2).joined(separator: ".")
+    }
+
+    nonisolated private static func copyCoordinated(_ source: URL, to destination: URL, using fm: FileManager) throws {
+        var coordinationError: NSError?
+        var copyError: Error?
+        NSFileCoordinator().coordinate(readingItemAt: source, options: [], error: &coordinationError) { readable in
+            do { try fm.copyItem(at: readable, to: destination) }
+            catch { copyError = error }
+        }
+        if let failure = coordinationError ?? copyError { throw failure }
     }
 
     /// The app's own name and icon, from its manifest and resource table --

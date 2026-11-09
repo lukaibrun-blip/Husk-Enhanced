@@ -194,7 +194,15 @@ bool tl_unity_start(const tl_unity_config *cfg)
     tl_nwindow_configure(cfg->width, cfg->height, cfg->metal_layer);
     int n = tl_dexidx_open(cfg->apk_path);
     if (n < 0) { tl_log_line("unity: could not safely index the APK's DEX"); return false; }
-    tl_log_line("unity: %d classes in the APK's DEX", n);
+    tl_log_line("unity: %d classes across the APK's DEX and splits", n);
+    if (!tl_dexidx_has_class("com/unity3d/player/UnityPlayer")) {
+        tl_log_line("unity: the selected APKs do not define com/unity3d/player/UnityPlayer");
+        return false;
+    }
+    if (!tl_dexidx_has_class("com/unity3d/player/NativeLoader")) {
+        tl_log_line("unity: the selected APKs do not define com/unity3d/player/NativeLoader; refusing to load libmain.so");
+        return false;
+    }
     if (!tl_ld_add_apk(cfg->apk_path)) return false;
     /* A player built to require ES 3.1 or 3.2 (its manifest's glEsVersion) asks only for those contexts and gives up on "your
      * device does not match the hardware requirements" when ANGLE refuses: it gets the 3.0 context described as 3.1/3.2 */
