@@ -32,6 +32,6 @@ func downloadContentRange(_ value: String?, _ offset: Int64) -> DownloadContentR
 func downloadUnsatisfiedRangeTotal(_ value: String?) -> Int64? {
     guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
           value.lowercased().hasPrefix("bytes */"),
-          let total = downloadRangeInteger(value.dropFirst(7)) else { return nil }
+          let total = downloadRangeInteger(value.dropFirst(8)) else { return nil }
     return total
 }
