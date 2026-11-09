@@ -4,55 +4,131 @@ import UIKit
 
 /// Keyboard input for the guest.
 ///
-/// Two routes, because they arrive completely differently:
-///
-///  * A hardware keyboard (Magic Keyboard, any Bluetooth one) delivers
-///    `pressesBegan`/`pressesEnded` with a HID usage code. That maps one-to-one
-///    onto QEMU's key codes, including modifiers and auto-repeat, so it is the
-///    accurate path and the one worth having.
-///  * The on-screen keyboard only ever reports *text*, via `UIKeyInput`. There is
-///    no key-down/key-up there, so each character is synthesised as a press and
-///    release, with shift wrapped around it when the character needs it.
-final class KeyCapturingView: UIView, UIKeyInput {
+/// A hidden text field lets iOS deliver committed input-method text (including
+/// marked-text composition) while hardware keys still use their HID codes. The
+/// on-screen keyboard has no key-up events, so mapped characters are synthesized
+/// as press/release pairs. Text outside the US key map is sent through Android's
+/// `input text` command, which may still be limited by the guest's keyboard map.
+final class KeyCapturingView: UITextField, UITextFieldDelegate {
 
     override var canBecomeFirstResponder: Bool { true }
 
-    // MARK: - UIKeyInput (software keyboard)
+    private var wantsFirstResponder = false
+    private var deliveredText = ""
+    private var heldHardwareKeys = Set<String>()
 
-    var hasText: Bool { true }
+    private static let softwareInputQueue = DispatchQueue(label: "husk.keyboard.software-input",
+                                                           qos: .userInitiated)
 
-    var keyboardType: UIKeyboardType = .asciiCapable
-    var autocorrectionType: UITextAutocorrectionType = .no
-    var autocapitalizationType: UITextAutocapitalizationType = .none
-    var spellCheckingType: UITextSpellCheckingType = .no
-    var smartQuotesType: UITextSmartQuotesType = .no
-    var smartDashesType: UITextSmartDashesType = .no
-
-    func insertText(_ text: String) {
-        for ch in text { sendCharacter(ch) }
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        configure()
     }
 
-    func deleteBackward() {
-        tap("backspace")
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configure()
     }
 
-    /// The on-screen keyboard gives no key-up, so press and release immediately.
-    private func sendCharacter(_ ch: Character) {
-        if ch == "\n" || ch == "\r" { tap("ret"); return }
-        if ch == " " { tap("spc"); return }
+    private func configure() {
+        borderStyle = .none
+        backgroundColor = .clear
+        textColor = .clear
+        tintColor = .clear
+        font = .systemFont(ofSize: 1)
+        keyboardType = .default
+        autocorrectionType = .no
+        autocapitalizationType = .none
+        spellCheckingType = .no
+        smartQuotesType = .no
+        smartDashesType = .no
+        isAccessibilityElement = false
+        accessibilityElementsHidden = true
+        delegate = self
+        addTarget(self, action: #selector(textDidChange), for: .editingChanged)
+    }
 
-        guard let (qcode, needsShift) = Self.characterMap[ch] else {
-            HuskLog.log("kbd", "no key for character \(String(reflecting: ch))")
-            return
+    func setActive(_ active: Bool) {
+        wantsFirstResponder = active
+        if active {
+            focusIfReady()
+        } else if isFirstResponder {
+            resignFirstResponder()
         }
-        if needsShift { _ = husk_display_send_key("shift", true) }
-        tap(qcode)
-        if needsShift { _ = husk_display_send_key("shift", false) }
     }
 
-    private func tap(_ qcode: String) {
-        _ = husk_display_send_key(qcode, true)
-        _ = husk_display_send_key(qcode, false)
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if wantsFirstResponder { focusIfReady() }
+    }
+
+    private func focusIfReady() {
+        guard wantsFirstResponder, window != nil, !isFirstResponder else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.wantsFirstResponder, self.window != nil else { return }
+            if !self.becomeFirstResponder() {
+                HuskLog.log("kbd", "could not focus the guest keyboard input view")
+            }
+        }
+    }
+
+    override func resignFirstResponder() -> Bool {
+        releaseHardwareKeys()
+        return super.resignFirstResponder()
+    }
+
+    override func deleteBackward() {
+        let hadText = !(text ?? "").isEmpty
+        super.deleteBackward()
+        if !hadText {
+            Self.softwareInputQueue.async { Self.tap("backspace") }
+        }
+    }
+
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        guard markedTextRange == nil else { return false }
+        Self.softwareInputQueue.async { Self.tap("ret") }
+        return false
+    }
+
+    @objc private func textDidChange() {
+        // Do not leak partial IME composition into the guest. Once the input
+        // method commits, diff against the last delivered string and forward it.
+        guard markedTextRange == nil else { return }
+        let currentText = text ?? ""
+        guard currentText != deliveredText else { return }
+
+        let oldCharacters = Array(deliveredText)
+        let newCharacters = Array(currentText)
+        var prefix = 0
+        while prefix < oldCharacters.count && prefix < newCharacters.count
+                && oldCharacters[prefix] == newCharacters[prefix] {
+            prefix += 1
+        }
+        var oldEnd = oldCharacters.count
+        var newEnd = newCharacters.count
+        while oldEnd > prefix && newEnd > prefix
+                && oldCharacters[oldEnd - 1] == newCharacters[newEnd - 1] {
+            oldEnd -= 1
+            newEnd -= 1
+        }
+
+        let backspaces = oldEnd - prefix
+        let inserted = newEnd > prefix ? String(newCharacters[prefix..<newEnd]) : ""
+        deliveredText = currentText
+        guard backspaces > 0 || !inserted.isEmpty else { return }
+
+        Self.softwareInputQueue.async {
+            for _ in 0..<backspaces { Self.tap("backspace") }
+            Self.sendInsertedText(inserted)
+        }
+    }
+
+    private func releaseHardwareKeys() {
+        for qcode in heldHardwareKeys.sorted() {
+            _ = husk_display_send_key(qcode, false)
+        }
+        heldHardwareKeys.removeAll()
     }
 
     // MARK: - Hardware keyboard
@@ -61,6 +137,7 @@ final class KeyCapturingView: UIView, UIKeyInput {
         var handled = false
         for press in presses {
             if let key = press.key, let qcode = Self.hidMap[key.keyCode] {
+                heldHardwareKeys.insert(qcode)
                 _ = husk_display_send_key(qcode, true)
                 handled = true
             }
@@ -72,6 +149,7 @@ final class KeyCapturingView: UIView, UIKeyInput {
         var handled = false
         for press in presses {
             if let key = press.key, let qcode = Self.hidMap[key.keyCode] {
+                heldHardwareKeys.remove(qcode)
                 _ = husk_display_send_key(qcode, false)
                 handled = true
             }
@@ -80,13 +158,61 @@ final class KeyCapturingView: UIView, UIKeyInput {
     }
 
     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        // Release everything we were told about, or the guest is left with a key
-        // stuck down.
+        var handled = false
         for press in presses {
             if let key = press.key, let qcode = Self.hidMap[key.keyCode] {
+                heldHardwareKeys.remove(qcode)
                 _ = husk_display_send_key(qcode, false)
+                handled = true
             }
         }
+        if !handled { super.pressesCancelled(presses, with: event) }
+    }
+
+    /// Mapped characters use QEMU key events. The fallback asks Android to map
+    /// the remaining text; Android does not promise arbitrary Unicode support
+    /// unless its active keyboard layout can represent those characters.
+    private static func sendInsertedText(_ text: String) {
+        var unmapped = ""
+
+        func flushUnmapped() {
+            guard !unmapped.isEmpty else { return }
+            let value = unmapped
+            unmapped = ""
+            do {
+                _ = try GuestBridge.shared.shell("input text \(shellQuoted(value))", timeout: 8)
+                HuskLog.log("kbd", "sent \(value.unicodeScalars.count) non-keymapped scalar(s) to Android input text")
+            } catch {
+                HuskLog.log("kbd", "Android text fallback failed: \(error.localizedDescription)")
+            }
+        }
+
+        for character in text {
+            if character == "\n" || character == "\r" {
+                flushUnmapped()
+                tap("ret")
+            } else if character == " " {
+                flushUnmapped()
+                tap("spc")
+            } else if let (qcode, needsShift) = characterMap[character] {
+                flushUnmapped()
+                if needsShift { _ = husk_display_send_key("shift", true) }
+                tap(qcode)
+                if needsShift { _ = husk_display_send_key("shift", false) }
+            } else {
+                unmapped.append(character)
+            }
+        }
+        flushUnmapped()
+    }
+
+    private static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func tap(_ qcode: String) {
+        _ = husk_display_send_key(qcode, true)
+        _ = husk_display_send_key(qcode, false)
     }
 
     // MARK: - Maps
@@ -192,19 +318,20 @@ struct KeyCapture: UIViewRepresentable {
     @Binding var active: Bool
 
     func makeUIView(context: Context) -> KeyCapturingView {
-        let v = KeyCapturingView()
-        v.isUserInteractionEnabled = true
-        return v
+        let view = KeyCapturingView(frame: .zero)
+        view.isUserInteractionEnabled = true
+        view.setActive(active)
+        return view
     }
 
     func updateUIView(_ view: KeyCapturingView, context: Context) {
-        // Showing the on-screen keyboard and capturing hardware keys are the same
-        // thing here: first-responder status drives both.
-        if active, !view.isFirstResponder {
-            view.becomeFirstResponder()
-        } else if !active, view.isFirstResponder {
-            view.resignFirstResponder()
-        }
+        // The view retries focus once it is attached to a window; doing it here
+        // also covers an already-mounted representable becoming active later.
+        view.setActive(active)
+    }
+
+    static func dismantleUIView(_ view: KeyCapturingView, coordinator: ()) {
+        view.setActive(false)
     }
 }
 
@@ -253,5 +380,11 @@ struct SpecialKeysBar: View {
             }
         }
         .foregroundStyle(.primary)
+        .onDisappear {
+            if ctrlLatched {
+                _ = husk_display_send_key("ctrl", false)
+                ctrlLatched = false
+            }
+        }
     }
 }

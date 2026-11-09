@@ -37,8 +37,7 @@ struct ContentView: View {
     @ObservedObject private var massTest = MassTest.shared
     @ObservedObject private var updates = AppUpdates.shared
     @State private var showWhatsNew = false
-    @State private var brandingChoice = UserDefaults.standard.string(forKey: "husk.branding.choice") ?? "ask"
-    @State private var showBranding = UserDefaults.standard.string(forKey: "husk.branding.choice") != "disabled"
+    @State private var showBranding = true
     @AppStorage(Holiday.key) private var holiday = true
 
     var body: some View {
@@ -64,6 +63,12 @@ struct ContentView: View {
                 StoreView()
                     .tabItem { Label("Store", systemImage: "cart.fill") }
                     .tag(HuskTab.store)
+
+                NavigationStack {
+                    DiscoverView(navigationTitle: "APK Store")
+                }
+                .tabItem { Label("APK Store", systemImage: "shippingbox.fill") }
+                .tag(HuskTab.apkStore)
 
                 SettingsTab()
                     .tabItem { Label("Settings", systemImage: "gearshape.fill") }
@@ -102,6 +107,7 @@ struct ContentView: View {
             if started && runner.isRunning {
                 GuestScreenView(showLogs: $showLogs,
                                 chromeHidden: false,
+                                screenVisible: showGuestScreen,
                                 onBack: { showGuestScreen = false })
                     .opacity(showGuestScreen ? 1 : 0)
                     .allowsHitTesting(showGuestScreen)
@@ -119,13 +125,14 @@ struct ContentView: View {
             }
 
             if showBranding {
-                BrandingSplash(isFirstLaunch: brandingChoice == "ask", onChoose: { enabled in
-                    brandingChoice = enabled ? "always" : "disabled"
-                    UserDefaults.standard.set(brandingChoice, forKey: "husk.branding.choice")
-                    withAnimation(.easeInOut(duration: 0.25)) { showBranding = false }
-                })
-                .transition(.opacity)
-                .zIndex(30)
+                BrandingSplash()
+                    .transition(.opacity)
+                    .zIndex(30)
+                    .task {
+                        try? await Task.sleep(nanoseconds: 350_000_000)
+                        guard !Task.isCancelled else { return }
+                        withAnimation(.easeInOut(duration: 0.35)) { showBranding = false }
+                    }
             }
 
             if confirmAndroid {
@@ -407,6 +414,7 @@ struct GuestScreenView: View {
     /// True while another tab is covering this one, so the guest's own controls
     /// are not drawn on top of a settings list.
     var chromeHidden = false
+    let screenVisible: Bool
     let onBack: () -> Void
     @State private var keyboard = false
     @State private var rotated = HuskGLView.rotated
@@ -465,7 +473,9 @@ struct GuestScreenView: View {
 
             // Zero-sized: it exists only to hold first-responder status, which is
             // what both the on-screen keyboard and hardware key events depend on.
-            KeyCapture(active: $keyboard).frame(width: 0, height: 0)
+            KeyCapture(active: Binding(get: { keyboard && screenVisible },
+                                       set: { keyboard = $0 }))
+                .frame(width: 0, height: 0)
 
             // The controls, as one pill at the bottom.
             //
@@ -556,6 +566,9 @@ struct GuestScreenView: View {
         .sheet(isPresented: $showControls) {
             ControlsSheet(keyboard: $keyboard)
                 .huskDetents([.height(300)])
+        }
+        .onChange(of: screenVisible) { visible in
+            if !visible { keyboard = false }
         }
     }
 }
@@ -789,11 +802,8 @@ enum AutoStart {
 
 
 
-/// A first-launch choice, then an optional branded screen on every later launch.
+/// A brief branded screen shown on every launch.
 private struct BrandingSplash: View {
-    let isFirstLaunch: Bool
-    let onChoose: (Bool) -> Void
-
     var body: some View {
         ZStack {
             Theme.bg.ignoresSafeArea()
@@ -809,25 +819,8 @@ private struct BrandingSplash: View {
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(Theme.textDim)
                 Spacer()
-                VStack(spacing: 10) {
-                    Button(isFirstLaunch ? "Always Show" : "Continue") { onChoose(true) }
-                        .buttonStyle(.borderedProminent)
-                        .buttonBorderShape(.capsule)
-                        .frame(maxWidth: .infinity)
-                    Button(isFirstLaunch ? "Disable" : "Disable Permanently", role: .cancel) { onChoose(false) }
-                        .buttonStyle(.bordered)
-                        .buttonBorderShape(.capsule)
-                        .frame(maxWidth: .infinity)
-                }
-                .padding(.horizontal, 28)
-                Text(isFirstLaunch ? "Choose whether to show this screen each time Husk opens." : "This screen is shown because you chose Always Show.")
-                    .font(.footnote)
-                    .foregroundStyle(Theme.textDim)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 32)
-                    .padding(.bottom, 20)
             }
-            .padding(.top, 20)
+            .padding(.vertical, 36)
         }
         .accessibilityElement(children: .contain)
     }

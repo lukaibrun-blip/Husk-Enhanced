@@ -3,6 +3,8 @@ import SwiftUI
 
 /// Apps from the repositories you add, saved into Husk's translation-layer library.
 struct DiscoverView: View {
+    var navigationTitle: String = "Discover"
+
     @ObservedObject private var manager = SourceManager.shared
     @ObservedObject private var host = AndroidHost.shared
     @ObservedObject private var downloads = Downloads.shared
@@ -33,7 +35,7 @@ struct DiscoverView: View {
             }
         }
         .background(Theme.backdrop)
-        .navigationTitle("Discover")
+        .navigationTitle(navigationTitle)
         .navigationBarTitleDisplayMode(.large)
         .searchable(text: $searchText, prompt: "Search \(totalAppCount) apps")
         .toolbar {
