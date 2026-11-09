@@ -1184,7 +1184,8 @@ static int g_mm_trace = -1;
 static void mm_trace(const char *what, void *a, size_t l, long x, long y)
 {
     if (g_mm_trace < 0) g_mm_trace = getenv("TL_MM_TRACE") ? 1 : 0;
-    if (!g_mm_trace) return;
+    bool failed_large_map = !strcmp(what, "mmap-failed") && l >= (64u << 20);
+    if (!g_mm_trace && !failed_large_map) return;
     /* a big one says who asked (the guest's code that called mmap, mprotect or madvise) */
     if (l >= (64u << 20)) {
         void *ra[8]; int n = backtrace(ra, 8);
@@ -1480,8 +1481,17 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
         tl_set_guest_errno(13); r = MAP_FAILED;
     }
     if (r != MAP_FAILED && (flags & 0x20)) anon_add(r, len);
+    int map_errno = r == MAP_FAILED ? errno : 0;
     mm_trace("mmap", r, len, prot, flags);
-    if (r == MAP_FAILED) tl_log_line("mm: mmap FAILED len=%#zx prot=%d flags=%#x errno=%d", len, prot, flags, errno);
+    if (r == MAP_FAILED) {
+        mm_trace("mmap-failed", addr, len, prot, flags);
+        if (len >= (64u << 20)) {
+            size_t guest = 0;
+            size_t used = tl_mm_address_space_used(&guest);
+            tl_log_line("mm: address space at failed map: total=%#zx guest-anonymous=%#zx", used, guest);
+        }
+        tl_log_line("mm: mmap FAILED hint=%p len=%#zx prot=%d flags=%#x off=%#lx errno=%d", addr, len, prot, flags, (unsigned long)off, map_errno);
+    }
     return r;
 }
 static int b_munmap(void *a, size_t l)

@@ -9,11 +9,25 @@ enum HuskOrientation {
     }
     static var mask: UIInterfaceOrientationMask = standard
 
+    /// Refresh orientation support throughout SwiftUI's container hierarchy. A navigation destination's hosting controller
+    /// is a child rather than a presented controller, so refreshing only presentedViewController leaves it stale.
+    @available(iOS 16.0, *)
+    @MainActor private static func refreshSupport(from root: UIViewController) -> String {
+        var visited = Set<ObjectIdentifier>()
+        var descriptions: [String] = []
+        func visit(_ controller: UIViewController) {
+            guard visited.insert(ObjectIdentifier(controller)).inserted else { return }
+            controller.setNeedsUpdateOfSupportedInterfaceOrientations()
+            descriptions.append("\(type(of: controller))=\(controller.supportedInterfaceOrientations.rawValue)")
+            controller.children.forEach(visit)
+            if let presented = controller.presentedViewController { visit(presented) }
+        }
+        visit(root)
+        return descriptions.joined(separator: " -> ")
+    }
+
     /// Allow only `new`, and turn the screen to it if it is not already there.
-    ///
-    /// A game's screen asks as it appears, while its full-screen cover is still being presented, and iOS can refuse then
-    /// ("Supported: portrait") because it has not yet asked the cover what it allows. So a refusal is retried a few times,
-    /// a moment apart, for as long as `new` is still what is wanted.
+    /// A refusal is retried while `new` is still what is wanted, and the controller hierarchy is refreshed each time.
     @MainActor static func set(_ new: UIInterfaceOrientationMask, attempt: Int = 0) {
         mask = new
         guard #available(iOS 16, *) else {
@@ -22,10 +36,14 @@ enum HuskOrientation {
             return
         }
         for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
-            var vc = scene.keyWindow?.rootViewController
-            while let v = vc { v.setNeedsUpdateOfSupportedInterfaceOrientations(); vc = v.presentedViewController }
+            let hierarchy: String
+            if let root = scene.keyWindow?.rootViewController {
+                hierarchy = refreshSupport(from: root)
+            } else {
+                hierarchy = "no root view controller"
+            }
             scene.requestGeometryUpdate(.iOS(interfaceOrientations: new)) { error in
-                HuskLog.log("ui", "orientation change refused (attempt \(attempt + 1)): \(error.localizedDescription)")
+                HuskLog.log("ui", "orientation change refused (attempt \(attempt + 1)): \(error.localizedDescription); controllers: \(hierarchy)")
                 guard attempt < 5 else { return }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                     if mask == new { set(new, attempt: attempt + 1) }
