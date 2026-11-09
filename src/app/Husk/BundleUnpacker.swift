@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import Compression
+import Darwin
 import Foundation
 
 /// Takes the APKs out of an app bundle: an .xapk (APKPure), .apkm (APKMirror) or .apks (bundletool), which are zip files holding a base APK and its splits and asset packs.
@@ -68,9 +69,34 @@ enum BundleUnpacker {
         }.map { $0.path }
     }
 
+    private struct CreatedFile {
+        let url: URL
+        let device: dev_t
+        let inode: ino_t
+    }
+
+    private struct CreatedDirectory {
+        let url: URL
+        let device: dev_t
+        let inode: ino_t
+    }
+
     /// Copies every APK in `bundle` into `dir`, and its expansion files (Android/obb/<package>/*.obb, which XAPKs carry) into `dir`/obb. Returns their names.
     @discardableResult
     static func unpack(_ bundle: URL, into dir: URL) throws -> [String] {
+        var createdFiles: [CreatedFile] = []
+        var createdDirectories: [CreatedDirectory] = []
+        do {
+            return try unpack(bundle, into: dir, createdFiles: &createdFiles,
+                              createdDirectories: &createdDirectories)
+        } catch {
+            rollback(files: createdFiles, directories: createdDirectories)
+            throw error
+        }
+    }
+
+    private static func unpack(_ bundle: URL, into dir: URL, createdFiles: inout [CreatedFile],
+                               createdDirectories: inout [CreatedDirectory]) throws -> [String] {
         let scoped = bundle.startAccessingSecurityScopedResource()
         defer { if scoped { bundle.stopAccessingSecurityScopedResource() } }
         let file = try FileHandle(forReadingFrom: bundle)
@@ -240,76 +266,64 @@ enum BundleUnpacker {
                   method != 0 || compressed == uncompressed else { throw Failure.notAZip }
             try file.seek(toOffset: dataStart)
 
-            // An expansion file goes to obb/ under its own name: the runtime finds it there when the game asks for Android/obb/<package>/<name>
-            var destDir = dir
-            if isOBB {
-                destDir = dir.appendingPathComponent("obb")
-                try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
-            }
+            // An expansion file goes to obb/ under its own name: the runtime finds it there when the game asks for Android/obb/<package>/<name>.
+            let destDir = isOBB ? dir.appendingPathComponent("obb", isDirectory: true) : dir
+            try ensureDirectory(at: destDir, createdDirectories: &createdDirectories)
             let dest = destDir.appendingPathComponent(base)
-            guard FileManager.default.createFile(atPath: dest.path, contents: Data()) else {
-                throw Failure.unsupported("\(base) could not be created while unpacking the bundle.")
-            }
+            let out = try createOutput(at: dest, createdFiles: &createdFiles)
             do {
-                let out = try FileHandle(forWritingTo: dest)
-                do {
-                    try out.truncate(atOffset: 0)
-                    var written: UInt64 = 0
-                    var checksum: UInt32 = 0
-                    var inflate: OutputFilter?
-                    if method == 8 {
-                        inflate = try OutputFilter(.decompress, using: .zlib) { data in
-                            guard let data else { return }
-                            let next = written.addingReportingOverflow(UInt64(data.count))
-                            let bundleNext = totalWritten.addingReportingOverflow(UInt64(data.count))
-                            guard !next.overflow, next.partialValue <= uncompressed,
-                                  !bundleNext.overflow, bundleNext.partialValue <= Self.maxBundleUncompressedSize else {
-                                throw Failure.unsupported("\(base) expanded beyond Husk's unpacking limit.")
-                            }
-                            checksum = Self.crc32(checksum, data)
-                            try out.write(contentsOf: data)
-                            written = next.partialValue
-                            totalWritten = bundleNext.partialValue
+                var written: UInt64 = 0
+                var checksum: UInt32 = 0
+                var inflate: OutputFilter?
+                if method == 8 {
+                    inflate = try OutputFilter(.decompress, using: .zlib) { data in
+                        guard let data else { return }
+                        let next = written.addingReportingOverflow(UInt64(data.count))
+                        let bundleNext = totalWritten.addingReportingOverflow(UInt64(data.count))
+                        guard !next.overflow, next.partialValue <= uncompressed,
+                              !bundleNext.overflow, bundleNext.partialValue <= Self.maxBundleUncompressedSize else {
+                            throw Failure.unsupported("\(base) expanded beyond Husk's unpacking limit.")
                         }
+                        checksum = Self.crc32(checksum, data)
+                        try out.write(contentsOf: data)
+                        written = next.partialValue
+                        totalWritten = bundleNext.partialValue
                     }
-                    var left = compressed
-                    while left > 0 {
-                        let chunk = Int(min(left, 4 << 20))
-                        let data = try readExactly(file, count: chunk)
-                        if let inflate {
-                            try inflate.write(data)
-                        } else {
-                            let next = written.addingReportingOverflow(UInt64(data.count))
-                            let bundleNext = totalWritten.addingReportingOverflow(UInt64(data.count))
-                            guard !next.overflow, next.partialValue <= uncompressed,
-                                  !bundleNext.overflow, bundleNext.partialValue <= Self.maxBundleUncompressedSize else {
-                                throw Failure.unsupported("\(base) expanded beyond Husk's unpacking limit.")
-                            }
-                            checksum = Self.crc32(checksum, data)
-                            try out.write(contentsOf: data)
-                            written = next.partialValue
-                            totalWritten = bundleNext.partialValue
-                        }
-                        left -= UInt64(data.count)
-                    }
-                    try inflate?.finalize()
-                    guard written == uncompressed else { throw Failure.unsupported("\(base) did not unpack to its declared size.") }
-                    guard checksum == expectedCRC else { throw Failure.unsupported("\(base) failed its ZIP CRC check.") }
-                    if hasDescriptor {
-                        let usesZip64Sizes = compressed32 == 0xffff_ffff || uncompressed32 == 0xffff_ffff ||
-                            le32(lh, 18) == 0xffff_ffff || le32(lh, 22) == 0xffff_ffff ||
-                            compressed > UInt64(UInt32.max) || uncompressed > UInt64(UInt32.max)
-                        try validateDescriptor(file, at: dataStart + compressed, before: directoryLimit,
-                                               zip64: usesZip64Sizes, crc: expectedCRC,
-                                               compressed: compressed, uncompressed: uncompressed)
-                    }
-                    try out.close()
-                } catch {
-                    try? out.close()
-                    throw error
                 }
+                var left = compressed
+                while left > 0 {
+                    let chunk = Int(min(left, 4 << 20))
+                    let data = try readExactly(file, count: chunk)
+                    if let inflate {
+                        try inflate.write(data)
+                    } else {
+                        let next = written.addingReportingOverflow(UInt64(data.count))
+                        let bundleNext = totalWritten.addingReportingOverflow(UInt64(data.count))
+                        guard !next.overflow, next.partialValue <= uncompressed,
+                              !bundleNext.overflow, bundleNext.partialValue <= Self.maxBundleUncompressedSize else {
+                            throw Failure.unsupported("\(base) expanded beyond Husk's unpacking limit.")
+                        }
+                        checksum = Self.crc32(checksum, data)
+                        try out.write(contentsOf: data)
+                        written = next.partialValue
+                        totalWritten = bundleNext.partialValue
+                    }
+                    left -= UInt64(data.count)
+                }
+                try inflate?.finalize()
+                guard written == uncompressed else { throw Failure.unsupported("\(base) did not unpack to its declared size.") }
+                guard checksum == expectedCRC else { throw Failure.unsupported("\(base) failed its ZIP CRC check.") }
+                if hasDescriptor {
+                    let usesZip64Sizes = compressed32 == 0xffff_ffff || uncompressed32 == 0xffff_ffff ||
+                        le32(lh, 18) == 0xffff_ffff || le32(lh, 22) == 0xffff_ffff ||
+                        compressed > UInt64(UInt32.max) || uncompressed > UInt64(UInt32.max)
+                    try validateDescriptor(file, at: dataStart + compressed, before: directoryLimit,
+                                           zip64: usesZip64Sizes, crc: expectedCRC,
+                                           compressed: compressed, uncompressed: uncompressed)
+                }
+                try out.close()
             } catch {
-                try? FileManager.default.removeItem(at: dest)
+                try? out.close()
                 throw error
             }
             names.append(isOBB ? "obb/" + base : base)
@@ -320,6 +334,87 @@ enum BundleUnpacker {
         }
         if !names.contains(where: { $0.lowercased().hasSuffix(".apk") }) { throw Failure.unsupported("There are no APKs in that bundle.") }
         return names
+    }
+
+    private static func createOutput(at url: URL, createdFiles: inout [CreatedFile]) throws -> FileHandle {
+        let descriptor = url.path.withCString {
+            open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode_t(0o600))
+        }
+        guard descriptor >= 0 else {
+            if errno == EEXIST {
+                throw Failure.unsupported("\(url.lastPathComponent) already exists in the destination folder.")
+            }
+            throw posixError(errno)
+        }
+
+        var identity = stat()
+        guard fstat(descriptor, &identity) == 0 else {
+            let code = errno
+            _ = close(descriptor)
+            _ = url.path.withCString { unlink($0) }
+            throw posixError(code)
+        }
+        createdFiles.append(CreatedFile(url: url, device: identity.st_dev, inode: identity.st_ino))
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    }
+
+    private static func ensureDirectory(at url: URL, createdDirectories: inout [CreatedDirectory]) throws {
+        var existing = stat()
+        let found = url.path.withCString { lstat($0, &existing) }
+        if found == 0 {
+            guard existing.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+                throw Failure.unsupported("The destination path \(url.path) is not a directory.")
+            }
+            return
+        }
+        guard errno == ENOENT else { throw posixError(errno) }
+
+        let parent = url.deletingLastPathComponent()
+        guard parent != url else { throw Failure.unsupported("The destination folder could not be created.") }
+        try ensureDirectory(at: parent, createdDirectories: &createdDirectories)
+
+        let result = url.path.withCString { mkdir($0, mode_t(0o700)) }
+        if result == 0 {
+            var identity = stat()
+            guard url.path.withCString({ lstat($0, &identity) }) == 0 else {
+                let code = errno
+                _ = url.path.withCString { rmdir($0) }
+                throw posixError(code)
+            }
+            createdDirectories.append(CreatedDirectory(url: url, device: identity.st_dev, inode: identity.st_ino))
+            return
+        }
+        if errno == EEXIST {
+            var raced = stat()
+            guard url.path.withCString({ lstat($0, &raced) }) == 0,
+                  raced.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else {
+                throw Failure.unsupported("The destination path \(url.path) is not a directory.")
+            }
+            return
+        }
+        throw posixError(errno)
+    }
+
+    private static func rollback(files: [CreatedFile], directories: [CreatedDirectory]) {
+        for file in files.reversed() {
+            var current = stat()
+            guard file.url.path.withCString({ lstat($0, &current) }) == 0,
+                  current.st_dev == file.device, current.st_ino == file.inode,
+                  current.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { continue }
+            _ = file.url.path.withCString { unlink($0) }
+        }
+        for directory in directories.reversed() {
+            var current = stat()
+            guard directory.url.path.withCString({ lstat($0, &current) }) == 0,
+                  current.st_dev == directory.device, current.st_ino == directory.inode,
+                  current.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR) else { continue }
+            // rmdir is deliberately non-recursive: never remove concurrent or pre-existing contents.
+            _ = directory.url.path.withCString { rmdir($0) }
+        }
+    }
+
+    private static func posixError(_ code: Int32) -> POSIXError {
+        POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
     }
 
     private static func readExactly(_ file: FileHandle, count: Int) throws -> Data {

@@ -330,6 +330,8 @@ targets:
       - path: HuskTests
       - path: Husk/DownloadRange.swift
       - path: Husk/APKIngestPlan.swift
+      - path: Husk/ApkMetadata.swift
+      - path: Husk/BundleUnpacker.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.husk.downloadrangetests
