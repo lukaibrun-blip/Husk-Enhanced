@@ -6,6 +6,8 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <dlfcn.h>
+#include <string.h>
 #define START 0x7000000000ULL
 #define END 0x7180000000ULL
 kern_return_t bounded_map(vm_map_t t,vm_address_t*a,vm_size_t s,vm_address_t m,int f,mem_entry_name_port_t o,vm_offset_t off,boolean_t cp,vm_prot_t p,vm_prot_t max,vm_inherit_t inh){
@@ -21,11 +23,22 @@ kern_return_t bounded_map(vm_map_t t,vm_address_t*a,vm_size_t s,vm_address_t m,i
  }
  return KERN_NO_SPACE;
 }
-static void *bounded_mmap(void*a,size_t n,int p,int f,int fd,off_t off){
- if(n==0x1fffc000ULL && p==PROT_NONE && (f&MAP_ANON) && !(f&MAP_FIXED)){
+typedef void *(*mmap_function)(void *, size_t, int, int, int, off_t);
+static mmap_function original_mmap;
+static int resolving_mmap;
+static void *bounded_mmap(void *address, size_t length, int protection, int flags, int fd, off_t offset)
+{
+ if(length==0x1fffc000ULL && protection==PROT_NONE && (flags&MAP_ANON) && !(flags&MAP_FIXED)){
   setenv("HUSK_TEST_UNITY_MAP_FAILURE_SEEN","1",1);errno=ENOMEM;return MAP_FAILED;
  }
- if(n>=0x100000000ULL && (f&MAP_ANON) && !(f&MAP_FIXED)){errno=ENOMEM;return MAP_FAILED;}
- return mmap(a,n,p,f,fd,off);
+ if(length>=0x100000000ULL && (flags&MAP_ANON) && !(flags&MAP_FIXED)){errno=ENOMEM;return MAP_FAILED;}
+ if (!original_mmap && !resolving_mmap) {
+  resolving_mmap = 1;
+  void *symbol = dlsym(RTLD_NEXT, "mmap");
+  memcpy(&original_mmap, &symbol, sizeof(original_mmap));
+  resolving_mmap = 0;
+ }
+ if (!original_mmap) { errno=ENOSYS; return MAP_FAILED; }
+ return original_mmap(address,length,protection,flags,fd,offset);
 }
 __attribute__((used,section("__DATA,__interpose"))) static const struct{const void*replacement;const void*original;} hooks[]={ {bounded_map,vm_map},{bounded_mmap,mmap} };
