@@ -1,7 +1,31 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* Include the production allocator to exercise its reservation/trim seam. */
+/* Redirect only the included production TU; test helpers use the host VM APIs directly. */
+#define _DARWIN_C_SOURCE
+#include <sys/mman.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+static void *test_mmap(void *, size_t, int, int, int, off_t);
+kern_return_t bounded_vm_map(vm_map_t, vm_address_t *, vm_size_t, vm_address_t, int,
+    mem_entry_name_port_t, vm_offset_t, boolean_t, vm_prot_t, vm_prot_t, vm_inherit_t);
+#define mmap test_mmap
+#define vm_map bounded_vm_map
 #include "../../src/translation-layer-next/husk-tl-bionic-io.c"
+#undef vm_map
+#undef mmap
 #include <assert.h>
+static void *test_mmap(void *address, size_t length, int protection, int flags, int fd, off_t offset)
+{
+    if (length == 0x1fffc000ULL && protection == PROT_NONE && (flags & MAP_ANON) && !(flags & MAP_FIXED)) {
+        setenv("HUSK_TEST_UNITY_MAP_FAILURE_SEEN", "1", 1);
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+    if (length >= 0x100000000ULL && (flags & MAP_ANON) && !(flags & MAP_FIXED)) {
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+    return mmap(address, length, protection, flags, fd, offset);
+}
 void tl_log_line(const char *fmt, ...) { (void)fmt; }
 bool husk_binder_is_fd(int fd) { (void)fd; return false; }
 bool tl_codewrite_enabled(void) { return false; }
@@ -38,7 +62,7 @@ static void test_memory_accounting(void)
     size_t guest_before = 0;
     size_t used_before = tl_mm_address_space_used(&guest_before);
     vm_address_t rx = 0;
-    assert(vm_map(mach_task_self(), &rx, jit_size, 0, VM_FLAGS_ANYWHERE,
+    assert(bounded_vm_map(mach_task_self(), &rx, jit_size, 0, VM_FLAGS_ANYWHERE,
         MACH_PORT_NULL, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_ALL,
         VM_INHERIT_NONE) == KERN_SUCCESS);
     vm_address_t rw = 0;
@@ -57,12 +81,13 @@ static void test_memory_accounting(void)
 #else
 #error "The dual-mapping self-test needs an arm64 or x86_64 host"
 #endif
-    /* Verify the shared backing and protection changes without executing JIT bytes. Hosted macOS
-     * runners may enforce code-signing/JIT policy that is not present in Husk's signed app runtime. */
     memcpy((void *)(uintptr_t)rw, code, sizeof(code));
+    sys_icache_invalidate((void *)(uintptr_t)rx, sizeof(code));
     uint8_t readback[sizeof(code)];
     memcpy(readback, (void *)(uintptr_t)rx, sizeof(readback));
     assert(memcmp(readback, code, sizeof(code)) == 0);
+    int (*jit_function)(void) = (int (*)(void))(void *)(uintptr_t)rx;
+    assert(jit_function() == 42);
 
     size_t guest_after = 0;
     size_t used_after = tl_mm_address_space_used(&guest_after);
@@ -144,6 +169,7 @@ static void test_memory_accounting(void)
 }
 
 int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);
     bool late = argc > 1 && !strcmp(argv[1], "late");
     size_t len = 2 * PHANTOM_HALF - getpagesize();
     assert(compressed_heap_request(len));
@@ -157,7 +183,7 @@ int main(int argc, char **argv) {
         husk_prepare_compressed_heap(); assert(g_compressed_heap);
     }
     vm_address_t alias = 0;
-    assert(vm_map(mach_task_self(), &alias, (vm_size_t)512 << 20, 0,
+    assert(bounded_vm_map(mach_task_self(), &alias, (vm_size_t)512 << 20, 0,
         VM_FLAGS_ANYWHERE, MACH_PORT_NULL, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
         VM_PROT_ALL, VM_INHERIT_COPY) == KERN_SUCCESS);
     void *p = phantom_reserve(len);
