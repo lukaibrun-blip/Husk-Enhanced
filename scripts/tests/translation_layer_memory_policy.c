@@ -27,7 +27,7 @@ static void test_allocator_selection_and_arguments(void)
 
     char line[128];
     tl_unity_format_command_line(line, sizeof(line), true, "-logFile player.log");
-    assert(strcmp(line, "-systemallocator -logFile player.log") == 0);
+    assert(strcmp(line, "-systemallocator -memorysetup-job-temp-allocator-block-size-background=262144 -logFile player.log") == 0);
     tl_unity_format_command_line(line, sizeof(line), false, "-logFile player.log");
     assert(strcmp(line, "-logFile player.log") == 0);
     tl_unity_format_command_line(line, sizeof(line), false, NULL);

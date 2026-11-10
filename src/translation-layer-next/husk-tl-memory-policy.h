@@ -21,8 +21,10 @@ static inline bool tl_unity_system_allocator_enabled(const char *force, bool add
 static inline void tl_unity_format_command_line(char *out, size_t size, bool system_allocator, const char *extra_args)
 {
     if (!size) return;
-    snprintf(out, size, "%s%s%s", system_allocator ? "-systemallocator" : "",
-             system_allocator && extra_args ? " " : "", extra_args ? extra_args : "");
+    const char *allocator_args = system_allocator
+        ? "-systemallocator -memorysetup-job-temp-allocator-block-size-background=262144" : "";
+    snprintf(out, size, "%s%s%s", allocator_args, system_allocator && extra_args ? " " : "",
+             extra_args ? extra_args : "");
 }
 
 /* A failed real mapping stays failed unless the narrow, intentional compressed-heap fallback applies. */

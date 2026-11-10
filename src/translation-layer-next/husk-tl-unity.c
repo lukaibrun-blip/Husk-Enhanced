@@ -170,11 +170,11 @@ static void *native_of(const char *cls, const char *name, const char *sig)
  * Unity's own allocators (its Dynamic Heap: 2022.3 does this) give each of their heaps a 256 MiB region of address space,
  * reserved as twice that and trimmed to an aligned half, and another region when one fills. A game at its menu holds 16 of
  * them, 4 GiB, with a few hundred MiB in use. An iOS app without the extended-virtual-addressing entitlement has a few GiB of
- * address space all told, of which Husk's JIT region takes 1 GiB, so such a game dies loading its assets: an mmap of
- * 0x1fffc000 bytes fails, then "Could not allocate memory: System out of memory!". Its boot.config memorysetup-* settings
- * size the blocks inside a region, not the regions. -systemallocator has the player use malloc, which takes address space as
- * memory is used, and leaves 4 of the regions (1 GiB). Where address space is plentiful the player keeps its own allocators.
- * TL_UNITY_SYSTEM_ALLOCATOR=1|0 decides instead; TL_UNITY_ARGS adds arguments of its own.
+ * address space all told, of which Husk's JIT region takes 1 GiB, so a game's large allocator reservations can fail even when
+ * physical memory is available. -systemallocator alone does not constrain Unity's background job temporary allocator; cap its
+ * block size at 256 KiB (128 MiB maximum with Unity's default growth policy) on short-address-space devices. This can increase
+ * overflow to the main heap and slow loading. Where address space is plentiful the player keeps its own allocators.
+ * TL_UNITY_SYSTEM_ALLOCATOR=1|0 decides instead; TL_UNITY_ARGS adds arguments of its own and can override the defaults.
  */
 static void set_command_line(void)
 {
@@ -186,7 +186,7 @@ static void set_command_line(void)
     tl_unity_format_command_line(line, sizeof(line), sys, extra);
     if (!line[0]) return;
     tl_hle_set_intent_extra("unity", line);
-    tl_log_line("unity: command line \"%s\"%s", line, sys ? " (malloc for the engine's memory: Unity's own allocators reserve more address space than there is)" : "");
+    tl_log_line("unity: command line \"%s\"%s", line, sys ? " (system allocator; background-job temporary blocks capped at 256 KiB)" : "");
 }
 
 bool tl_unity_start(const tl_unity_config *cfg)

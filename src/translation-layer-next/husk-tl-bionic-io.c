@@ -1387,21 +1387,44 @@ bool tl_mm_address_space_short(void)
     return v;
 }
 
-/* The address space this process has mapped, outside the shared system libraries and the kernel's guard over the addresses it
- * may never use (hundreds of GiB above its limit), and how much of it is the guest's own anonymous memory: what a game's log
- * needs to tell a phone out of address space from one out of memory. */
+/* The task's leaf virtual-address ranges, excluding the shared-system submap and entries with no possible access.
+ * PROT_NONE reservations with a higher maximum protection still count; guest-anonymous is a separate virtual-range tracker,
+ * not physical memory. */
 size_t tl_mm_address_space_used(size_t *guest)
 {
     size_t total = 0;
     for (vm_address_t a = 0;;) {
         vm_size_t sz = 0; natural_t depth = 0;
         vm_region_submap_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
-        if (vm_region_recurse_64(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt) != KERN_SUCCESS) break;
-        if (!info.is_submap && !(info.user_tag == VM_MEMORY_GUARD && info.max_protection == VM_PROT_NONE)) total += sz;
+        if (vm_region_recurse_64(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt) != KERN_SUCCESS || !sz) break;
+        if (!info.is_submap && (info.protection | info.max_protection) != VM_PROT_NONE) total += sz;
         a += sz;
     }
     if (guest) *guest = anon_total();
     return total;
+}
+
+/* A failed large request needs enough context to distinguish large reservations, aliases and kernel regions. Keep the
+ * top-level walk so the shared-system submap is reported once rather than counting every image inside it. */
+static void mm_log_large_regions(void)
+{
+    for (vm_address_t a = 0;;) {
+        vm_size_t sz = 0; natural_t depth = 0;
+        vm_region_submap_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt) != KERN_SUCCESS || !sz) break;
+        if (sz >= (64u << 20)) {
+            if (info.is_submap) {
+                tl_log_line("mm: large submap addr=%p len=%#zx prot=%d max=%d tag=%u share=%u object=%#llx",
+                    (void *)(uintptr_t)a, (size_t)sz, info.protection, info.max_protection, info.user_tag,
+                    (unsigned)info.share_mode, (unsigned long long)info.object_id_full);
+            } else {
+                tl_log_line("mm: large mapping addr=%p len=%#zx prot=%d max=%d tag=%u flags=%#x share=%u object=%#llx",
+                    (void *)(uintptr_t)a, (size_t)sz, info.protection, info.max_protection, info.user_tag,
+                    (unsigned)info.flags, (unsigned)info.share_mode, (unsigned long long)info.object_id_full);
+            }
+        }
+        a += sz;
+    }
 }
 
 void *tl_ld_map_code(const char *path, uint64_t off, size_t len, void *at);
@@ -1413,7 +1436,12 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
         char path[PATH_MAX];
         if (fcntl(fd, F_GETPATH, path) != -1) {
             void *r = tl_ld_map_code(path, (uint64_t)off, len, (flags & 0x10) ? addr : NULL);
-            if (r) { tl_note_once("a library's file mapped executable (libffi trampolines): its signed code is mapped again"); mm_trace("mmap-code", r, len, prot, flags); return r; }
+            if (r) {
+                if (flags & 0x10) anon_remove((uintptr_t)r, len);
+                tl_note_once("a library's file mapped executable (libffi trampolines): its signed code is mapped again");
+                mm_trace("mmap-code", r, len, prot, flags);
+                return r;
+            }
         }
     }
     /* JIT-less mode (TL_NO_XMEM): no executable memory exists, so a guest's own executable mapping (a regex or script JIT:
@@ -1473,6 +1501,10 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
             : mmap(addr, len, prot_filter(prot, "mmap"), df, (flags & 0x20) ? -1 : fd, off);
     r = tl_mm_retry_phantom_reservation(r, len, prot, flags, force_phantom, phantom_reserve);
     TL_ERRNO_END();
+    /* A successful MAP_FIXED file mapping has already replaced any guest-anonymous range,
+     * even if executable file mappings are rejected and immediately unmapped below. */
+    if (r != MAP_FAILED && (flags & 0x10) && !(flags & 0x20))
+        anon_remove((uintptr_t)r, len);
     /* a file mapped executable (libffi's trampolines: its own library's code page, or a temporary file holding a copy): a phone
        can not make file pages executable, and a library's file offsets are not where the loader put its code, so the mapping
        fails here as it would there, and libffi takes anonymous executable memory instead (a piece of the JIT region) */
@@ -1490,6 +1522,7 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
             size_t guest = 0;
             size_t used = tl_mm_address_space_used(&guest);
             tl_log_line("mm: address space at failed map: total=%#zx guest-anonymous=%#zx", used, guest);
+            mm_log_large_regions();
         }
         tl_log_line("mm: mmap FAILED hint=%p len=%#zx prot=%d flags=%#x off=%#lx errno=%d", addr, len, prot, flags, (unsigned long)off, map_errno);
     }
@@ -1508,8 +1541,10 @@ static int b_munmap(void *a, size_t l)
     { int sr; if (shifted_unmap(a, &sr)) { mm_trace("munmap", a, l, sr, errno); return sr; } }
     size_t real = phantom_clamp((uintptr_t)a, l);
     if (real == 0) return 0;                                 /* the half of a phantom range that was never mapped */
-    anon_remove((uintptr_t)a, real);
-    TL_ERRNO_BEGIN(); int r = munmap(a, real); TL_ERRNO_END(); mm_trace("munmap", a, real, r, errno); return r;
+    TL_ERRNO_BEGIN(); int r = munmap(a, real); int e = errno; TL_ERRNO_END();
+    if (r == 0) anon_remove((uintptr_t)a, real);
+    mm_trace("munmap", a, real, r, r ? e : 0);
+    return r;
 }
 /* Whether a range is inside memory the guest mapped for itself (not a library's own pages). */
 static bool anon_contains(uintptr_t addr, size_t len)

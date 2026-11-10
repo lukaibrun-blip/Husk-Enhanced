@@ -113,20 +113,26 @@ struct AppDiagnosis: Identifiable, Equatable {
                                 evidence: l)
         }
 
-        // Out of address space, not memory: a reservation of address space was refused (an allocator's PROT_NONE mmap failing with
-        // ENOMEM), and the engine gave up. Unity's own allocators reserve 256 MiB regions, as 512 MiB each, far ahead of use; an iOS
-        // app without the extended-virtual-addressing entitlement has a few GiB of address space, and installs re-signed with their
-        // user's own team often lose it. What follows the refusal (a crash, iOS closing Husk) follows from it.
-        if let i = lines.firstIndex(where: { $0.contains("mmap FAILED") && $0.contains(" prot=0 ") && $0.contains("errno=12") }),
+        // A large PROT_NONE mapping failed with ENOMEM. That proves the reservation failed, not whether address-space limits,
+        // fragmentation, VM-map resources or another kernel limit caused it. Physical-memory headroom does not answer that question.
+        if let i = lines.lastIndex(where: { $0.contains("mmap FAILED") && $0.contains(" prot=0 ") && $0.contains("errno=12") }),
            let oom = lines[i...].first(where: { $0.contains("System out of memory!") }) {
-            return AppDiagnosis(kind: .outOfAddressSpace, title: String(localized: "Out of address space"),
-                                detail: String(localized: """
-                                        The game ran out of address space, not memory: iOS refused to set aside more addresses for it. An app \
-                                        without the extended virtual addressing entitlement gets only a few GB of addresses, and installs \
-                                        re-signed with your own Apple account or team often lose that entitlement. Install Husk with it kept, \
-                                        then start the game again.
-                                        """),
-                                evidence: lines[i] + "\n" + oom)
+            let contextStart = lines[..<i].lastIndex(where: { $0.contains("mmap FAILED") }).map { $0 + 1 } ?? 0
+            let context = lines[contextStart..<i]
+            let policy = context.last(where: { $0.contains("mm: refusing") })
+            let usage = context.last(where: { $0.contains("address space at failed map:") })
+            let regions = context.filter { $0.contains("mm: large mapping") || $0.contains("mm: large submap") }.suffix(8)
+            let evidence = ([policy, usage] + regions.map { Optional($0) } + [Optional(lines[i]), Optional(oom)]).compactMap { $0 }.joined(separator: "\n")
+            let title = String(localized: policy == nil ? "Virtual memory reservation failed" : "Test memory limit refused mapping")
+            let detail = policy == nil
+                ? String(localized: """
+                          The game requested a large range of virtual addresses, and iOS returned ENOMEM. This confirms that the \
+                          mapping failed, but the log cannot establish why: address-space limits, fragmentation, or VM-map \
+                          resource limits can all cause this. The available-memory reading measures physical-memory headroom, not \
+                          free virtual address space. The report includes the mapping and address-space readings to help investigate.
+                          """)
+                : String(localized: "A configured TL_MM_* test limit refused this mapping. This is a test-policy result, not evidence that iOS itself ran out of virtual address space.")
+            return AppDiagnosis(kind: .outOfAddressSpace, title: title, detail: detail, evidence: evidence)
         }
 
         // A native crash: the runtime's crash handler names the library the bad instruction was in
