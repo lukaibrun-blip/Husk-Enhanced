@@ -638,7 +638,7 @@ private struct DownloadsNotice: View {
             return "\(running.count) downloading\(pct)"
         }
         if downloads.jobs.contains(where: \.failed) { return "A download failed" }
-        if let release = updates.available { return "Husk \(release.version) is out" }
+        if let release = updates.available, updates.shouldNotify { return "Husk \(release.version) is out" }
         if guest.update.isSomething { return "Android update ready" }
         return nil
     }

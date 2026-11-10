@@ -81,7 +81,8 @@ struct WhatsNewSheet: View {
 
 // MARK: - a newer Husk
 
-/// A newer Husk on GitHub: the releases page is asked at launch (at most twice a day) and the person is told once per release.
+/// Checks the official Husk GitHub Releases endpoint. Checks are throttled to twice a day; failures only
+/// update this optional status and never affect launching or running Husk.
 @MainActor
 final class AppUpdates: ObservableObject {
     static let shared = AppUpdates()
@@ -89,45 +90,149 @@ final class AppUpdates: ObservableObject {
     struct Release: Equatable {
         let version: String
         let page: URL
+        let ipa: URL?
+        let summary: String
+
+        var updateURL: URL { ipa ?? page }
     }
 
-    @Published var available: Release?
+    @Published private(set) var available: Release?
+    @Published private(set) var checking = false
+    @Published private(set) var statusMessage: String?
+    @Published private(set) var errorMessage: String?
+    @Published private(set) var lastCheckedAt: Date?
+    @Published private(set) var dismissedVersion: String?
 
     private static let api = URL(string: "https://api.github.com/repos/Leviidev/Husk/releases/latest")!
     private static let checkedKey = "husk.updates.checked", dismissedKey = "husk.updates.dismissed"
+    private static let checkInterval: TimeInterval = 12 * 60 * 60
+
+    private init() {
+        let defaults = UserDefaults.standard
+        let lastCheck = defaults.double(forKey: Self.checkedKey)
+        lastCheckedAt = lastCheck > 0 ? Date(timeIntervalSince1970: lastCheck) : nil
+        dismissedVersion = defaults.string(forKey: Self.dismissedKey)
+    }
 
     static var current: String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0" }
+    var shouldNotify: Bool { available != nil && available?.version != dismissedVersion }
 
-    func check() async {
-        let d = UserDefaults.standard
-        if Date().timeIntervalSince1970 - d.double(forKey: Self.checkedKey) < 12 * 3600 { return }
-        var req = URLRequest(url: Self.api)
-        req.timeoutInterval = 20
-        req.setValue("Husk", forHTTPHeaderField: "User-Agent")
-        guard let (data, response) = try? await URLSession.shared.data(for: req),
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let tag = obj["tag_name"] as? String,
-              let page = (obj["html_url"] as? String).flatMap(URL.init(string:)) else { return }
-        d.set(Date().timeIntervalSince1970, forKey: Self.checkedKey)
-        let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-        guard Self.newer(version, than: Self.current), d.string(forKey: Self.dismissedKey) != version else { return }
-        HuskLog.log("update", "Husk \(version) is out (this is \(Self.current))")
-        available = Release(version: version, page: page)
+    func check(force: Bool = false) async {
+        guard !checking else { return }
+        let defaults = UserDefaults.standard
+        let now = Date()
+        if !force, now.timeIntervalSince1970 - defaults.double(forKey: Self.checkedKey) < Self.checkInterval { return }
+
+        checking = true
+        statusMessage = nil
+        errorMessage = nil
+        defer { checking = false }
+
+        do {
+            var request = URLRequest(url: Self.api)
+            request.timeoutInterval = 20
+            request.setValue("Husk Enhanced", forHTTPHeaderField: "User-Agent")
+            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { throw CheckError.invalidResponse }
+            guard http.statusCode == 200 else { throw CheckError.http(http.statusCode) }
+
+            let result = try JSONDecoder().decode(GitHubRelease.self, from: data)
+            guard !result.draft, !result.prerelease,
+                  let version = AppUpdateSupport.normalizedVersion(result.tagName),
+                  let page = Self.trustedURL(result.htmlURL, pathPrefix: "/Leviidev/Husk/releases/tag/") else {
+                throw CheckError.unverifiedRelease
+            }
+            let ipa = result.assets.first(where: { $0.name.caseInsensitiveCompare("Husk.ipa") == .orderedSame })
+                .flatMap { Self.trustedURL($0.browserDownloadURL, pathPrefix: "/Leviidev/Husk/releases/download/") }
+            let summary = AppUpdateSupport.summary(from: result.body ?? "")
+            let release = Release(version: version, page: page, ipa: ipa, summary: summary)
+
+            defaults.set(now.timeIntervalSince1970, forKey: Self.checkedKey)
+            lastCheckedAt = now
+            if Self.newer(version, than: Self.current) {
+                available = release
+                statusMessage = "Version \(version) is available."
+                HuskLog.log("update", "Husk \(version) is out (this is \(Self.current))")
+            } else {
+                available = nil
+                statusMessage = "Husk is up to date."
+            }
+        } catch {
+            guard !Task.isCancelled else { return }
+            defaults.set(now.timeIntervalSince1970, forKey: Self.checkedKey)
+            lastCheckedAt = now
+            errorMessage = Self.message(for: error)
+            HuskLog.log("update", "release check failed: \(error.localizedDescription)")
+        }
     }
 
     func dismiss() {
-        if let v = available?.version { UserDefaults.standard.set(v, forKey: Self.dismissedKey) }
-        available = nil
+        guard let version = available?.version else { return }
+        UserDefaults.standard.set(version, forKey: Self.dismissedKey)
+        dismissedVersion = version
     }
 
-    /// "1.0.10" is newer than "1.0.9": compared number by number.
+    /// "1.0.10" is newer than "1.0.9": compare numeric components, not strings.
     static func newer(_ a: String, than b: String) -> Bool {
-        let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
-        for i in 0..<max(x.count, y.count) {
-            let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
-            if p != q { return p > q }
+        AppUpdateSupport.isNewer(a, than: b)
+    }
+
+    private static func trustedURL(_ raw: String, pathPrefix: String) -> URL? {
+        guard let parts = URLComponents(string: raw),
+              parts.scheme?.lowercased() == "https",
+              parts.host?.lowercased() == "github.com",
+              parts.port == nil || parts.port == 443,
+              parts.user == nil, parts.password == nil,
+              parts.path.hasPrefix(pathPrefix) else { return nil }
+        return parts.url
+    }
+
+    private static func message(for error: Error) -> String {
+        if let error = error as? CheckError {
+            switch error {
+            case .http(403): return "GitHub temporarily limited update checks. Try again later."
+            case .http(let code): return "GitHub Releases is unavailable (HTTP \(code)). Try again later."
+            case .invalidResponse, .unverifiedRelease: return "Husk couldn't verify the release information from GitHub. Try again later."
+            }
         }
-        return false
+        if let error = error as? URLError {
+            switch error.code {
+            case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed:
+                return "No internet connection. Connect to Wi-Fi or cellular data and try again."
+            case .timedOut:
+                return "GitHub did not respond in time. Try again later."
+            default:
+                return "Couldn't check GitHub Releases: \(error.localizedDescription)"
+            }
+        }
+        return "Couldn't read GitHub's release information: \(error.localizedDescription)"
+    }
+
+    private enum CheckError: Error {
+        case http(Int)
+        case invalidResponse
+        case unverifiedRelease
+    }
+
+    private struct GitHubRelease: Decodable {
+        let tagName: String
+        let htmlURL: String
+        let body: String?
+        let draft: Bool
+        let prerelease: Bool
+        let assets: [Asset]
+
+        enum CodingKeys: String, CodingKey {
+            case tagName = "tag_name"
+            case htmlURL = "html_url"
+            case body, draft, prerelease, assets
+        }
+
+        struct Asset: Decodable {
+            let name: String
+            let browserDownloadURL: String
+            enum CodingKeys: String, CodingKey { case name; case browserDownloadURL = "browser_download_url" }
+        }
     }
 }

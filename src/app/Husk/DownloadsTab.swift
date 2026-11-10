@@ -77,10 +77,13 @@ struct DownloadsTab: View {
     @ViewBuilder private var updatesSection: some View {
         Section("Updates") {
             if let release = updates.available {
-                HStack {
-                    Label("Husk \(release.version)", systemImage: "arrow.down.app.fill")
-                    Spacer()
-                    Button("View") { UIApplication.shared.open(release.page) }.buttonStyle(.bordered)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Label("Husk \(release.version)", systemImage: "arrow.down.app.fill")
+                        Spacer()
+                        Button("Download") { UIApplication.shared.open(release.updateURL) }.buttonStyle(.bordered)
+                    }
+                    Text(release.summary).font(.caption).foregroundStyle(.secondary)
                 }
             }
             if guest.update.isSomething {
@@ -90,8 +93,14 @@ struct DownloadsTab: View {
                     Button("Download") { guest.applyUpdate() }.buttonStyle(.bordered)
                 }
             }
-            if updates.available == nil && !guest.update.isSomething {
-                Label("Everything is up to date", systemImage: "checkmark.circle").foregroundStyle(.secondary)
+            if let error = updates.errorMessage {
+                Label(error, systemImage: "wifi.exclamationmark")
+                    .font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if updates.available == nil && !guest.update.isSomething {
+                Label(updates.checking ? "Checking for updates…" : updates.statusMessage ?? "App updates are checked periodically",
+                      systemImage: updates.checking ? "arrow.triangle.2.circlepath" : "checkmark.circle")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
     }

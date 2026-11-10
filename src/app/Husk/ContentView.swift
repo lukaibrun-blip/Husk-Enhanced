@@ -177,19 +177,29 @@ struct ContentView: View {
         .fullScreenCover(isPresented: $showWhatsNew) {
             WhatsNewSheet { WhatsNew.markSeen(); showWhatsNew = false }
         }
-        // A newer Husk is on GitHub.
+        // A newer Husk is on GitHub. An update check is optional and never gates the app.
         .alert("Husk \(updates.available?.version ?? "") Is Available", isPresented: Binding(
-                get: { updates.available != nil && !showOnboarding && !showWhatsNew && crash.pending == nil },
+                get: { updates.shouldNotify && !showOnboarding && !showWhatsNew && crash.pending == nil },
                 set: { if !$0 { updates.dismiss() } })) {
-            Button("View Release") {
-                if let page = updates.available?.page { UIApplication.shared.open(page) }
+            Button("Atualizar agora") {
+                if let release = updates.available { UIApplication.shared.open(release.updateURL) }
                 updates.dismiss()
             }
-            Button("Not Now", role: .cancel) { updates.dismiss() }
+            Button("Depois", role: .cancel) { updates.dismiss() }
         } message: {
-            Text("You have \(AppUpdates.current). The new version's IPA is on its release page.")
+            if let release = updates.available {
+                Text("Instalada: \(AppUpdates.current)\nMais recente: \(release.version)\n\n\(release.summary)")
+            }
         }
-        .task { await updates.check() }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            await updates.check()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 12 * 60 * 60 * 1_000_000_000)
+                guard !Task.isCancelled else { break }
+                await updates.check()
+            }
+        }
         .task { await CompatibilityStore.shared.refresh() }
         .sheet(isPresented: $router.showFiles) { FilesTab() }
         .sheet(isPresented: $router.showDownloads) { DownloadsTab() }
