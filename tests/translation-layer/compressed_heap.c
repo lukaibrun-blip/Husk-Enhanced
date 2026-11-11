@@ -56,23 +56,29 @@ const char *tl_ld_symbol_at(const void *addr, const char **lib_name, const void 
 
 static void test_memory_accounting(void)
 {
+    puts("TRACE: memory accounting entered");
     assert(!getenv("TL_MM_MAX_GIB") && !getenv("TL_MM_TOTAL_GIB") && !getenv("TL_MM_PHANTOM"));
 
     const vm_size_t jit_size = (vm_size_t)512 << 20;
     size_t guest_before = 0;
+    puts("TRACE: querying initial address-space usage");
     size_t used_before = tl_mm_address_space_used(&guest_before);
+    puts("TRACE: initial address-space query returned");
     vm_address_t rx = 0;
     assert(bounded_vm_map(mach_task_self(), &rx, jit_size, 0, VM_FLAGS_ANYWHERE,
         MACH_PORT_NULL, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_ALL,
         VM_INHERIT_NONE) == KERN_SUCCESS);
+    printf("TRACE: RX mapping at %p\n", (void *)(uintptr_t)rx);
     vm_address_t rw = 0;
     vm_prot_t cur = VM_PROT_NONE, max = VM_PROT_NONE;
     assert(vm_remap(mach_task_self(), &rw, jit_size, 0, VM_FLAGS_ANYWHERE,
         mach_task_self(), rx, FALSE, &cur, &max, VM_INHERIT_NONE) == KERN_SUCCESS);
+    printf("TRACE: RW alias at %p\n", (void *)(uintptr_t)rw);
     assert(vm_protect(mach_task_self(), rw, jit_size, FALSE,
         VM_PROT_READ | VM_PROT_WRITE) == KERN_SUCCESS);
     assert(vm_protect(mach_task_self(), rx, jit_size, FALSE,
         VM_PROT_READ | VM_PROT_EXECUTE) == KERN_SUCCESS);
+    puts("TRACE: JIT mappings protected");
 
 #if defined(__arm64__) || defined(__aarch64__)
     static const uint32_t code[] = { 0x52800540u, 0xD65F03C0u }; /* mov w0, #42; ret */
@@ -87,10 +93,14 @@ static void test_memory_accounting(void)
     memcpy(readback, (void *)(uintptr_t)rx, sizeof(readback));
     assert(memcmp(readback, code, sizeof(code)) == 0);
     int (*jit_function)(void) = (int (*)(void))(void *)(uintptr_t)rx;
+    printf("TRACE: invoking JIT entry %p\n", (void *)(uintptr_t)jit_function);
     assert(jit_function() == 42);
+    puts("TRACE: JIT returned 42");
 
     size_t guest_after = 0;
+    puts("TRACE: querying final address-space usage");
     size_t used_after = tl_mm_address_space_used(&guest_after);
+    puts("TRACE: final address-space query returned");
     assert(used_after >= used_before + 2 * jit_size);
     assert(guest_after == guest_before);
 
@@ -163,8 +173,10 @@ static void test_memory_accounting(void)
     assert(b_munmap(full, 2 * page) == 0);
     assert(anon_total() == baseline);
 
+    puts("TRACE: releasing JIT aliases");
     assert(vm_deallocate(mach_task_self(), rw, jit_size) == KERN_SUCCESS);
     assert(vm_deallocate(mach_task_self(), rx, jit_size) == KERN_SUCCESS);
+    puts("TRACE: JIT aliases released");
     puts("PASS: 512 MiB dual-view JIT self-test, failed Unity map, protections and mapping accounting");
 }
 
@@ -202,6 +214,8 @@ int main(int argc, char **argv) {
         assert(!munmap(p, PHANTOM_HALF));
         puts("PASS: early reservation, retry, single transfer, trim, commit at both ends");
     }
+    puts("TRACE: releasing constrained-window alias");
     assert(vm_deallocate(mach_task_self(), alias, (vm_size_t)512 << 20) == KERN_SUCCESS);
+    puts("TRACE: constrained-window alias released");
     if (late) test_memory_accounting();
 }
