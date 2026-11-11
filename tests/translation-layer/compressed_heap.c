@@ -9,13 +9,24 @@ kern_return_t bounded_vm_map(vm_map_t, vm_address_t *, vm_size_t, vm_address_t, 
     mem_entry_name_port_t, vm_offset_t, boolean_t, vm_prot_t, vm_prot_t, vm_inherit_t);
 #define mmap test_mmap
 #define vm_map bounded_vm_map
+#define backtrace test_backtrace
 #include "../../src/translation-layer-next/husk-tl-bionic-io.c"
+#undef backtrace
 #undef vm_map
 #undef mmap
 #include <assert.h>
+extern int backtrace(void **, int);
+int test_backtrace(void **frames, int count)
+{
+    puts("TRACE: entering production backtrace adapter");
+    int captured = backtrace(frames, count);
+    printf("TRACE: production backtrace returned %d frames\n", captured);
+    return captured;
+}
 static void *test_mmap(void *address, size_t length, int protection, int flags, int fd, off_t offset)
 {
     if (length == 0x1fffc000ULL && protection == PROT_NONE && (flags & MAP_ANON) && !(flags & MAP_FIXED)) {
+        puts("TRACE: host mmap adapter rejecting Unity allocation");
         setenv("HUSK_TEST_UNITY_MAP_FAILURE_SEEN", "1", 1);
         errno = ENOMEM;
         return MAP_FAILED;
@@ -108,7 +119,10 @@ static void test_memory_accounting(void)
     size_t guest_before_failure = anon_total();
     assert(!getenv("HUSK_TEST_UNITY_MAP_FAILURE_SEEN"));
     errno = 0;
-    assert(b_mmap(NULL, unity_request, PROT_NONE, 0x22, -1, 0) == MAP_FAILED);
+    puts("TRACE: entering expected large-map failure");
+    void *failed_mapping = b_mmap(NULL, unity_request, PROT_NONE, 0x22, -1, 0);
+    puts("TRACE: expected large-map failure returned");
+    assert(failed_mapping == MAP_FAILED);
     assert(getenv("HUSK_TEST_UNITY_MAP_FAILURE_SEEN"));
     assert(errno == ENOMEM);
     assert(anon_total() == guest_before_failure);

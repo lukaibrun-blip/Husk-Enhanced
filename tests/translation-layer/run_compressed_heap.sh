@@ -13,7 +13,7 @@ if "$OUT/test" late; then
 else
   late_status=$?
   printf 'Late test failed with status %s; collecting an LLDB backtrace.\n' "$late_status"
-  lldb --batch -o run -o 'register read pc lr fp sp' -o 'thread backtrace all' -- "$OUT/test" late || true
+  lldb --batch -o run -o 'register read pc x30 x29 sp' -o 'thread backtrace all' -- "$OUT/test" late || true
   if "$OUT/test"; then
     early_status=0
   else
