@@ -625,7 +625,6 @@ private struct JITNotice: View {
 /// Downloads at a glance, only while there is something to say: what is coming in, a failure, an update.
 private struct DownloadsNotice: View {
     @ObservedObject private var downloads = Downloads.shared
-    @ObservedObject private var updates = AppUpdates.shared
     @ObservedObject private var guest = GuestImage.shared
     @ObservedObject private var router = Router.shared
 
@@ -638,7 +637,6 @@ private struct DownloadsNotice: View {
             return "\(running.count) downloading\(pct)"
         }
         if downloads.jobs.contains(where: \.failed) { return "A download failed" }
-        if let release = updates.available, updates.shouldNotify { return "Husk \(release.version) is out" }
         if guest.update.isSomething { return "Android update ready" }
         return nil
     }

@@ -10,8 +10,6 @@ struct SettingsTab: View {
     @AppStorage(AppWindows.defaultKey) private var multitask = false
     @AppStorage(CompatibilityStore.askKey) private var askCompat = true
     @ObservedObject private var account = Account.shared
-    @ObservedObject private var updates = AppUpdates.shared
-    @Environment(\.openURL) private var openURL
 
     var body: some View {
         NavigationStack {
@@ -28,42 +26,6 @@ struct SettingsTab: View {
                 Section("JIT") {
                     row(JITSettings(), "bolt.fill", .yellow, "JIT & Sideload", "StikJIT is built in — the recommended way")
                     row(JITLessSettings(), "bolt.slash.fill", .mint, "Play without JIT", "No debugger")
-                }
-
-                Section("App Updates") {
-                    LabeledContent("Installed version", value: AppUpdates.current)
-                    if let release = updates.available {
-                        LabeledContent("Latest version", value: release.version)
-                        Text(release.summary)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Button {
-                            openURL(release.updateURL)
-                            updates.dismiss()
-                        } label: {
-                            Label("Atualizar agora", systemImage: "arrow.down.app.fill")
-                        }
-                    }
-                    Button {
-                        Task { await updates.check(force: true) }
-                    } label: {
-                        Label(updates.checking ? "Checking…" : "Check for Updates",
-                              systemImage: updates.checking ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
-                    }
-                    .disabled(updates.checking)
-                    if let error = updates.errorMessage {
-                        Text(error).font(.caption).foregroundStyle(.orange)
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else if let status = updates.statusMessage {
-                        Text(status).font(.caption).foregroundStyle(.secondary)
-                    }
-                    if let checked = updates.lastCheckedAt {
-                        Text("Last checked \(checked.formatted(date: .abbreviated, time: .shortened))")
-                            .font(.caption2).foregroundStyle(.tertiary)
-                    }
-                } footer: {
-                    Text("Husk checks the official GitHub Releases page periodically. iOS requires you to install the downloaded IPA through your sideloading app; Husk never replaces itself silently.")
                 }
 
                 Section("General") {

@@ -103,8 +103,8 @@ enum FAQ {
                  answer: "Open the app's page in your Library and tap **Share Report**. For Husk's own log, go to "
                        + "Settings › About › **Open Console**. Turning on **Developer Info** there adds more detail."),
             Item(question: "How do I update Husk?",
-                 answer: "Husk tells you when a new version is out. Install the new IPA over the old one with the same sideloader. "
-                       + "Your library, apps and saves are kept."),
+                 answer: "Check the [Husk releases page](https://github.com/Leviidev/Husk/releases) for a new IPA, then install it over the old one with the same sideloader. "
+                       + "Husk does not check for app updates automatically. Your library, apps and saves are kept."),
         ]),
         Section(title: "Apps and Games", symbol: "gamecontroller.fill", items: [
             Item(question: "How do I add a PS4 game?",

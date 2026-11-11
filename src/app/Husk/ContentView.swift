@@ -35,7 +35,6 @@ struct ContentView: View {
     @ObservedObject private var tlStore = TranslationLayerStore.shared
     @ObservedObject private var crash = CrashReport.shared
     @ObservedObject private var massTest = MassTest.shared
-    @ObservedObject private var updates = AppUpdates.shared
     @State private var showWhatsNew = false
     @State private var showBranding = true
     @AppStorage(Holiday.key) private var holiday = true
@@ -176,29 +175,6 @@ struct ContentView: View {
         // After an update: what it brought, once.
         .fullScreenCover(isPresented: $showWhatsNew) {
             WhatsNewSheet { WhatsNew.markSeen(); showWhatsNew = false }
-        }
-        // A newer Husk is on GitHub. An update check is optional and never gates the app.
-        .alert("Husk \(updates.available?.version ?? "") Is Available", isPresented: Binding(
-                get: { updates.shouldNotify && !showOnboarding && !showWhatsNew && crash.pending == nil },
-                set: { if !$0 { updates.dismiss() } })) {
-            Button("Atualizar agora") {
-                if let release = updates.available { UIApplication.shared.open(release.updateURL) }
-                updates.dismiss()
-            }
-            Button("Depois", role: .cancel) { updates.dismiss() }
-        } message: {
-            if let release = updates.available {
-                Text("Instalada: \(AppUpdates.current)\nMais recente: \(release.version)\n\n\(release.summary)")
-            }
-        }
-        .task(id: scenePhase) {
-            guard scenePhase == .active else { return }
-            await updates.check()
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 12 * 60 * 60 * 1_000_000_000)
-                guard !Task.isCancelled else { break }
-                await updates.check()
-            }
         }
         .task { await CompatibilityStore.shared.refresh() }
         .sheet(isPresented: $router.showFiles) { FilesTab() }

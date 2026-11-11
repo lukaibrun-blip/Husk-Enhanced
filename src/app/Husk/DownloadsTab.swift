@@ -5,7 +5,6 @@ import SwiftUI
 struct DownloadsTab: View {
     @ObservedObject private var downloads = Downloads.shared
     @ObservedObject private var store = PlayStoreManager.shared
-    @ObservedObject private var updates = AppUpdates.shared
     @ObservedObject private var guest = GuestImage.shared
     @State private var adding = false
     @Environment(\.dismiss) private var dismiss
@@ -13,7 +12,7 @@ struct DownloadsTab: View {
     var body: some View {
         NavigationStack {
             HuskPageList {
-                updatesSection
+                if guest.update.isSomething { guestUpdateSection }
                 Section {
                     if downloads.jobs.isEmpty {
                         VStack(alignment: .leading, spacing: 6) {
@@ -74,33 +73,12 @@ struct DownloadsTab: View {
         }
     }
 
-    @ViewBuilder private var updatesSection: some View {
+    private var guestUpdateSection: some View {
         Section("Updates") {
-            if let release = updates.available {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Label("Husk \(release.version)", systemImage: "arrow.down.app.fill")
-                        Spacer()
-                        Button("Download") { UIApplication.shared.open(release.updateURL) }.buttonStyle(.bordered)
-                    }
-                    Text(release.summary).font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            if guest.update.isSomething {
-                HStack {
-                    Label(guest.update.title, systemImage: "shippingbox.fill")
-                    Spacer()
-                    Button("Download") { guest.applyUpdate() }.buttonStyle(.bordered)
-                }
-            }
-            if let error = updates.errorMessage {
-                Label(error, systemImage: "wifi.exclamationmark")
-                    .font(.caption).foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if updates.available == nil && !guest.update.isSomething {
-                Label(updates.checking ? "Checking for updates…" : updates.statusMessage ?? "App updates are checked periodically",
-                      systemImage: updates.checking ? "arrow.triangle.2.circlepath" : "checkmark.circle")
-                    .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Label(guest.update.title, systemImage: "shippingbox.fill")
+                Spacer()
+                Button("Download") { guest.applyUpdate() }.buttonStyle(.bordered)
             }
         }
     }
