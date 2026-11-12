@@ -189,6 +189,12 @@ static void set_command_line(void)
     tl_log_line("unity: command line \"%s\"%s", line, sys ? " (system allocator; background-job temporary blocks capped at 256 KiB)" : "");
 }
 
+static void log_native_loader_method(const char *name, const char *sig, uint32_t flags, void *ctx)
+{
+    (void)ctx;
+    tl_log_line("unity: DEX NativeLoader.%s%s static=%d", name, sig, (flags & 8) != 0);
+}
+
 bool tl_unity_start(const tl_unity_config *cfg)
 {
     U.cfg = *cfg;
@@ -205,13 +211,22 @@ bool tl_unity_start(const tl_unity_config *cfg)
         tl_log_line("unity: the selected APKs do not define com/unity3d/player/NativeLoader; refusing to load libmain.so");
         return false;
     }
-    if (!tl_ld_add_apk(cfg->apk_path)) return false;
+    tl_dexidx_each_member("com/unity3d/player/NativeLoader", true, log_native_loader_method, NULL);
+    bool dex_load_static = false;
+    bool dex_has_load = tl_dexidx_declares_method("com/unity3d/player/NativeLoader", "load", "(Ljava/lang/String;)Z", &dex_load_static);
+    tl_log_line("unity: DEX NativeLoader.load(String)Z exact=%d static=%d", dex_has_load, dex_load_static);
+    if (!tl_ld_add_apk(cfg->apk_path)) { tl_log_line("unity: loader could not index the game APK"); return false; }
+    tl_log_line("unity: APK and split libraries registered");
     /* A player built to require ES 3.1 or 3.2 (its manifest's glEsVersion) asks only for those contexts and gives up on "your
      * device does not match the hardware requirements" when ANGLE refuses: it gets the 3.0 context described as 3.1/3.2 */
     { int tl_manifest_gles(const char *); void tl_egl_es3_claim(int); int gv = tl_manifest_gles(cfg->apk_path);
       if (getenv("TL_GLES_CLAIM")) gv = 0x30000 | atoi(getenv("TL_GLES_CLAIM"));   /* TL_GLES_CLAIM=<minor>: as if the manifest said 3.<minor> */
       if (gv >= 0x30001) { tl_egl_es3_claim(gv & 0xffff); tl_log_line("egl: the manifest asks for OpenGL ES 3.%d: the driver is described so", gv & 0xffff); } }
-    if (cfg->angle_egl && !tl_egl_init(cfg->angle_egl, cfg->angle_gles, cfg->frame_dir, cfg->frame_every)) return false;
+    if (cfg->angle_egl) {
+        tl_log_line("unity: initializing ANGLE");
+        if (!tl_egl_init(cfg->angle_egl, cfg->angle_gles, cfg->frame_dir, cfg->frame_every)) { tl_log_line("unity: ANGLE initialization failed"); return false; }
+        tl_log_line("unity: ANGLE initialization complete");
+    }
     tl_jni_init();
     tl_hle_configure(cfg->package_name, cfg->apk_path, cfg->data_dir, cfg->width, cfg->height);
     set_command_line();
@@ -219,31 +234,40 @@ bool tl_unity_start(const tl_unity_config *cfg)
     keyboard_install();
     tl_ld_on_init(il2cpp_on_lib_init);
 
-    /* new UnityPlayer(activity): the Java side's own constructor calls loadNative(dir),
-     * which is System.load(dir + "/libmain.so") followed by NativeLoader.load(dir). */
+    /* The host model allocates UnityPlayer's native receiver directly rather than invoking its Java constructor. Reproduce
+     * the relevant native startup sequence below: load libmain, run JNI_OnLoad, then call NativeLoader.load(dir). */
     U.activity = tl_hle_activity();
+    tl_log_line("unity: allocating UnityPlayer native receiver");
     U.player = tl_jni_new_object(tl_jni_class("com/unity3d/player/UnityPlayer"));
+    tl_log_line("unity: UnityPlayer native receiver allocated");
 
     /* Android's main thread has its Looper before any app code runs: Unity's libmain asks for it while loading (JNI_OnLoad
      * -> ALooper_forThread), and the NULL it gets here is kept as the engine's main-thread queue and dereferenced later. */
     { void *(*looper_prepare)(int) = tl_bionic_find("ALooper_prepare"); if (looper_prepare) looper_prepare(0); }
 
+    tl_log_line("unity: mapping libmain.so");
     tl_lib *main_lib = tl_ld_load("libmain.so");
-    if (!main_lib) return false;
+    if (!main_lib) { tl_log_line("unity: libmain.so mapping/loading failed"); return false; }
+    tl_log_line("unity: initializing libmain.so constructors");
     tl_ld_init(main_lib);
+    tl_log_line("unity: libmain.so constructors returned");
     onload_fn onload = (onload_fn)tl_ld_sym(main_lib, "JNI_OnLoad");
     if (!onload) { tl_log_line("unity: libmain.so has no JNI_OnLoad"); return false; }
+    tl_log_line("unity: calling libmain JNI_OnLoad");
     int32_t ver = tl_a32_is_fn((void *)onload) ? tl_a32_jni_onload(main_lib) : onload(tl_jni_vm(), NULL);
     tl_log_line("unity: libmain JNI_OnLoad -> %#x", ver);
     if (tl_jni_pending()) { tl_log_line("unity: an exception is pending after libmain's JNI_OnLoad"); return false; }
 
     typedef uint8_t (*load_fn)(void *env, void *cls, void *dir);
+    tl_log_line("unity: resolving registered NativeLoader.load(String)Z");
     load_fn load = (load_fn)native_of("com/unity3d/player/NativeLoader", "load", "(Ljava/lang/String;)Z");
-    if (!load) return false;
+    if (!load) { tl_log_line("unity: NativeLoader.load(String)Z has no registered native"); return false; }
     jobj *dir = tl_jni_new_string("/data/app/lib/arm64");
+    tl_log_line("unity: calling NativeLoader.load(String)");
     uint8_t ok = load(tl_jni_env(), tl_jni_class_object("com/unity3d/player/NativeLoader"), dir);
-    tl_log_line("unity: NativeLoader.load -> %d", ok);
+    tl_log_line("unity: NativeLoader.load -> %d (pending exception=%d)", ok, tl_jni_pending());
     if (ok) il2cpp_host_hooks();
+    else tl_log_line("unity: NativeLoader.load returned false; stopping before UnityPlayer initJni");
     return ok != 0;
 }
 
@@ -277,6 +301,7 @@ static void *unity_main(void *arg)
     /* The jobs UnityPlayer queues for this thread, in the order it queues them. */
     if (phase < 1) {
         phase = 1;
+        tl_log_line("unity: initializing graphics state and surface");
         jobj *surface = tl_jni_new_object(tl_jni_class("android/view/Surface"));
         NATIVE_VOID("nativeRecreateGfxState", "(ILandroid/view/Surface;)V", 0, surface);
         tl_log_line("unity: nativeRecreateGfxState done");
@@ -284,11 +309,13 @@ static void *unity_main(void *arg)
         NATIVE_VOID("nativeResume", "()V", 0, 0);
         tl_log_line("unity: nativeResume done");
         NATIVE_VOID("nativeFocusChanged", "(Z)V", 1, 0);
+        tl_log_line("unity: initial surface/focus notifications done");
     }
     /* What Unity's Java side tells the engine as it starts on a phone: the media volume (AudioVolumeHandler reports it, and
      * an engine that never hears it takes the device as muted) and that its sound is not muted. */
     if (phase < 2) {
         phase = 2;
+        tl_log_line("unity: initializing audio state");
         jobj *volume = tl_jni_new_object(tl_jni_class("com/unity3d/player/AudioVolumeHandler"));
         call_native_on("com/unity3d/player/AudioVolumeHandler", volume, "onAudioVolumeChanged", "(I)V", 7, 0);
         NATIVE_VOID("nativeMuteMasterAudio", "(Z)V", 0, 0);
@@ -297,8 +324,10 @@ static void *unity_main(void *arg)
 
     void *render = native_of("com/unity3d/player/UnityPlayer", "nativeRender", "()Z");
     bool was_paused = false;
+    bool first_render = true;
     phase = 3;
     g_unity_jmp_armed = 2;
+    if (render) tl_log_line("unity: entering nativeRender loop");
     while (render && !atomic_load(&U.stop)) {
         if (atomic_load(&U.paused)) {
             if (!was_paused) { NATIVE_VOID("nativeFocusChanged", "(Z)V", 0, 0); NATIVE_VOID("nativePause", "()Z", 0, 0); was_paused = true; tl_log_line("unity: paused"); }
@@ -309,6 +338,7 @@ static void *unity_main(void *arg)
         keyboard_deliver();
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (first_render) tl_log_line("unity: calling first nativeRender");
         uint8_t keep = ((uint8_t (*)(void *, void *))render)(tl_jni_env(), U.player);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         {
@@ -319,6 +349,7 @@ static void *unity_main(void *arg)
             while (ns > m && !atomic_compare_exchange_weak(&U.perf_max_ns, &m, ns)) {}
         }
         atomic_fetch_add(&U.frames, 1);
+        if (first_render) { tl_log_line("unity: first nativeRender returned %d", keep); first_render = false; }
         if (!keep) { tl_log_line("unity: nativeRender returned false: the engine asked to quit"); break; }
         usleep(2000);
     }
@@ -328,25 +359,28 @@ static void *unity_main(void *arg)
 
 bool tl_unity_run(void)
 {
-    /* The UnityPlayer constructor's last native step before it starts the thread. */
-    /* Unity 6 adds the kind of host it runs in (0: an activity or service, 1: a GameActivity) and, in some players, a
-     * string beside it; which one a player has is its RegisterNatives' to say. Asking for the wrong one means initJni
-     * never runs, and the engine then holds NULL for the Java side's classes (GetMethodID(NULL class, ...) later). */
+    /* Mirror UnityPlayer's native initialization steps before starting UnityMain. Unity 6 adds the kind of host it runs in
+     * (0: an activity or service, 1: a GameActivity) and, in some players, a string beside it; which one a player has is its
+     * RegisterNatives' to say. Asking for the wrong one means initJni never runs, and the engine then holds NULL for the Java
+     * side's classes (GetMethodID(NULL class, ...) later). */
+    tl_log_line("unity: resolving UnityPlayer.initJni overloads");
     void *init3 = tl_jni_native("com/unity3d/player/UnityPlayer", "initJni", "(Landroid/content/Context;ILjava/lang/String;)V");
     void *init2 = init3 ? NULL : tl_jni_native("com/unity3d/player/UnityPlayer", "initJni", "(Landroid/content/Context;I)V");
     if (init3) {
+        tl_log_line("unity: calling initJni(Context,int,String)");
         jobj *kind = tl_jni_new_string("");
         ((void (*)(void *, jobj *, jobj *, int, jobj *))init3)(tl_jni_env(), U.player, U.activity, 0, kind);
     } else if (init2) {
+        tl_log_line("unity: calling initJni(Context,int)");
         ((void (*)(void *, jobj *, jobj *, int))init2)(tl_jni_env(), U.player, U.activity, 0);
     } else {
+        tl_log_line("unity: trying initJni(Context) fallback");
         NATIVE_VOID("initJni", "(Landroid/content/Context;)V", U.activity, 0);
     }
-    tl_log_line("unity: initJni done");
-    /* The rest of the UnityPlayer constructor: the helpers it builds, whose constructors each call a
-     * native that gives the engine its reference to the helper's Java class. Without these the engine
-     * holds NULL where it expects a class and fails later, far from the cause. */
-    /* ...and the web request helper's class, which UnityPlayer's constructor hands the engine so it can find the request methods. */
+    tl_log_line("unity: initJni done (pending exception=%d)", tl_jni_pending());
+    /* Mirror UnityPlayer's remaining helper-native registrations. Without these the engine holds NULL where it expects a
+     * helper class and can fail later, far from the cause. */
+    /* The web request helper's class is also handed to the engine so it can find the request methods. */
     NATIVE_VOID("nativeInitWebRequest", "(Ljava/lang/Class;)V", tl_jni_class_object("com/unity3d/player/UnityWebRequest"), 0);
     tl_log_line("unity: nativeInitWebRequest done");
     jobj *cam = tl_jni_new_object(tl_jni_class("com/unity3d/player/Camera2Wrapper"));
@@ -355,11 +389,14 @@ bool tl_unity_run(void)
     call_native_on("com/unity3d/player/HFPStatus", hfp, "initHFPStatusJni", "()V", 0, 0);
     jobj *olock = tl_jni_new_object(tl_jni_class("com/unity3d/player/OrientationLockListener"));
     call_native_on("com/unity3d/player/OrientationLockListener", olock, "nativeUpdateOrientationLockState", "(I)V", 1, 0);
+    tl_log_line("unity: UnityPlayer helper initialization done (pending exception=%d)", tl_jni_pending());
     pthread_attr_t a;
     pthread_attr_init(&a);
     pthread_attr_setstacksize(&a, 16u << 20);
-    if (pthread_create(&U.thread, &a, unity_main, NULL) != 0) return false;
+    int err = pthread_create(&U.thread, &a, unity_main, NULL);
+    if (err != 0) { tl_log_line("unity: could not start UnityMain thread (pthread_create=%d)", err); return false; }
     U.thread_started = true;
+    tl_log_line("unity: UnityMain thread launched");
     return true;
 }
 

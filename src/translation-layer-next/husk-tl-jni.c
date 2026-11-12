@@ -1096,6 +1096,20 @@ static void jni_ReleaseStringCritical(void *env, jo s, const uint16_t *c) { jni_
 typedef struct { const char *name, *sig; void *fn; } native_method;
 static unsigned g_natives_generation;
 
+static bool dex_chain_declares_method(const char *class_name, const char *name, const char *sig, bool exact)
+{
+    char current[1024], super[1024];
+    snprintf(current, sizeof(current), "%s", class_name);
+    for (int depth = 0; depth < 64 && current[0]; depth++) {
+        bool found = exact ? tl_dexidx_declares_method(current, name, sig, NULL) : tl_dexidx_method_named(current, name);
+        if (found) return true;
+        const char *next = tl_dexidx_super(current, super, sizeof(super));
+        if (!next || !next[0] || !strcmp(next, current)) break;
+        snprintf(current, sizeof(current), "%s", next);
+    }
+    return false;
+}
+
 static int32_t jni_RegisterNatives(void *env, jo cls, const native_method *m, int32_t n)
 {
     (void)env;
@@ -1113,9 +1127,14 @@ static int32_t jni_RegisterNatives(void *env, jo cls, const native_method *m, in
         bool declared = tl_dvm_declares(c, m[i].name, m[i].sig);
         for (tl_jclass *k = given->super; !declared && k; k = k->super)
             if (tl_dvm_declares(k, m[i].name, m[i].sig)) { c = k; declared = true; }
-        if (!declared)
+        if (!declared) {
             tl_log_line("jni: RegisterNatives %s.%s%s: declared by no class in the chain, bound to %s anyway",
                         given->name, m[i].name, m[i].sig, c->name);
+            if (!strcmp(given->name, "com/unity3d/player/NativeLoader"))
+                tl_log_line("jni: NativeLoader RegisterNatives DEX chain exact=%d same-name=%d",
+                            dex_chain_declares_method(given->name, m[i].name, m[i].sig, true),
+                            dex_chain_declares_method(given->name, m[i].name, m[i].sig, false));
+        }
         c->natives = realloc(c->natives, (size_t)(c->nnatives + 1) * sizeof(*c->natives));
         c->natives[c->nnatives].name = strdup(m[i].name);
         c->natives[c->nnatives].sig = strdup(m[i].sig);

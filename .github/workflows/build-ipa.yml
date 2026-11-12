@@ -45,6 +45,31 @@ jobs:
           DD: ${{ runner.temp }}/husk-derived-data
         run: ./scripts/ci_build.sh "$RUNNER_TEMP/Husk-Enhanced.ipa"
 
+      - name: Verify diagnostic instrumentation is embedded in the IPA
+        run: |
+          set -euo pipefail
+          IPA="$RUNNER_TEMP/Husk-Enhanced.ipa"
+          DYLIB="$RUNNER_TEMP/husk-diagnostic-qemu.dylib"
+          STRINGS="$RUNNER_TEMP/husk-diagnostic-qemu.strings"
+          unzip -p "$IPA" Payload/Husk.app/Frameworks/libqemu-aarch64-softmmu.dylib > "$DYLIB"
+          strings "$DYLIB" > "$STRINGS"
+          markers=(
+            'unity: DEX NativeLoader.load(String)Z exact='
+            'jni: NativeLoader RegisterNatives DEX chain exact='
+            'unity: calling libmain JNI_OnLoad'
+            'unity: NativeLoader.load -> %d (pending exception=%d)'
+            'unity: initJni done (pending exception=%d)'
+            'unity: calling first nativeRender'
+            'unity: first nativeRender returned %d'
+          )
+          for marker in "${markers[@]}"; do
+            if ! grep -Fq "$marker" "$STRINGS"; then
+              echo "Missing diagnostic marker in packaged QEMU dylib: $marker" >&2
+              exit 1
+            fi
+          done
+          echo "All Unity/JNI diagnostic markers are present in the IPA's QEMU dylib."
+
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
