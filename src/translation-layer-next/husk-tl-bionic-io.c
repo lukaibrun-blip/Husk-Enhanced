@@ -1427,6 +1427,24 @@ static void mm_log_large_regions(void)
     }
 }
 
+/* How much address space is left, measured rather than read off a total: the largest reservation that still succeeds says
+ * whether a refused one was a near miss or came with nothing left to give. The probe is given back before it returns. */
+static void mm_log_free_space(void)
+{
+    static const size_t steps[] = { (size_t)1 << 30, (size_t)512 << 20, (size_t)256 << 20, (size_t)128 << 20, (size_t)64 << 20 };
+    int saved = errno;
+    for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+        void *p = mmap(NULL, steps[i], PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (p == MAP_FAILED) continue;
+        munmap(p, steps[i]);
+        tl_log_line("mm: %zu MiB of address space is still reservable", steps[i] >> 20);
+        errno = saved;
+        return;
+    }
+    tl_log_line("mm: not even 64 MiB of address space can be reserved");
+    errno = saved;
+}
+
 void *tl_ld_map_code(const char *path, uint64_t off, size_t len, void *at);
 static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
 {
@@ -1523,6 +1541,7 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
             size_t used = tl_mm_address_space_used(&guest);
             tl_log_line("mm: address space at failed map: total=%#zx guest-anonymous=%#zx", used, guest);
             mm_log_large_regions();
+            mm_log_free_space();
         }
         tl_log_line("mm: mmap FAILED hint=%p len=%#zx prot=%d flags=%#x off=%#lx errno=%d", addr, len, prot, flags, (unsigned long)off, map_errno);
     }

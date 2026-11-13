@@ -50,10 +50,12 @@ jobs:
         run: |
           set -euo pipefail
           IPA="$RUNNER_TEMP/Husk-Enhanced.ipa"
-          DYLIB="$RUNNER_TEMP/husk-diagnostic-qemu.dylib"
-          STRINGS="$RUNNER_TEMP/husk-diagnostic-qemu.strings"
-          unzip -p "$IPA" Payload/Husk.app/Frameworks/libqemu-aarch64-softmmu.dylib > "$DYLIB"
-          strings "$DYLIB" > "$STRINGS"
+          BINARY="$RUNNER_TEMP/husk-diagnostic-app"
+          STRINGS="$RUNNER_TEMP/husk-diagnostic-app.strings"
+          # The translation layer is compiled into the app itself, not into the QEMU library: src/app/project.yml and
+          # HuskBridge.h both say so. The markers are therefore in the app's Mach-O, not in libqemu-aarch64-softmmu.dylib.
+          unzip -p "$IPA" Payload/Husk.app/Husk > "$BINARY"
+          strings "$BINARY" > "$STRINGS"
           markers=(
             'unity: DEX NativeLoader.load(String)Z exact='
             'jni: NativeLoader RegisterNatives DEX chain exact='
@@ -65,11 +67,11 @@ jobs:
           )
           for marker in "${markers[@]}"; do
             if ! grep -Fq "$marker" "$STRINGS"; then
-              echo "Missing diagnostic marker in packaged QEMU dylib: $marker" >&2
+              echo "Missing diagnostic marker in the packaged app binary: $marker" >&2
               exit 1
             fi
           done
-          echo "All Unity/JNI diagnostic markers are present in the IPA's QEMU dylib."
+          echo "All Unity/JNI diagnostic markers are present in the IPA's app binary."
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
