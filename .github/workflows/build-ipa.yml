@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - work/audit-bundle-dvm-android
+      - fix/tl-memory-test-errno
   workflow_dispatch:
 
 permissions:

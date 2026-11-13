@@ -43,7 +43,14 @@ bool tl_codewrite_enabled(void) { return false; }
 bool tl_ld_aot_contains(const void *addr) { (void)addr; return false; }
 bool tl_ld_covers(const void *addr, size_t len) { (void)addr; (void)len; return false; }
 bool tl_xmem_contains(const void *addr) { (void)addr; return false; }
-void tl_set_guest_errno(int error) { (void)error; }
+/* TL_ERRNO_END() (husk-tl-bionic.h) publishes a host errno as the guest's, and asks the translation that lives in husk-tl-bionic.c
+ * for the number. This test does not link that file, and -Wl,-undefined,dynamic_lookup binds a symbol it does not define to NULL:
+ * the first call then faults at address 0, with nothing in the backtrace to name it. So every entry point the exercised paths
+ * reach is defined here. The errnos this test produces are the same number on both sides (ENOMEM 12, EINVAL 22, EACCES 13), so the
+ * translation is the identity; what it handed the guest is kept so the refused reservation can be shown to have reported ENOMEM. */
+static int g_guest_errno, g_guest_errno_calls;
+int tl_errno_to_guest(int darwin_errno) { return darwin_errno; }
+void tl_set_guest_errno(int error) { g_guest_errno = error; g_guest_errno_calls++; }
 void tl_note_once(const char *what) { (void)what; }
 static bool return_fixed_code_map;
 static int code_map_calls;
@@ -118,6 +125,7 @@ static void test_memory_accounting(void)
     const size_t unity_request = 0x1fffc000;
     size_t guest_before_failure = anon_total();
     assert(!getenv("HUSK_TEST_UNITY_MAP_FAILURE_SEEN"));
+    int errno_crossings = g_guest_errno_calls;
     errno = 0;
     puts("TRACE: entering expected large-map failure");
     void *failed_mapping = b_mmap(NULL, unity_request, PROT_NONE, 0x22, -1, 0);
@@ -125,6 +133,8 @@ static void test_memory_accounting(void)
     assert(failed_mapping == MAP_FAILED);
     assert(getenv("HUSK_TEST_UNITY_MAP_FAILURE_SEEN"));
     assert(errno == ENOMEM);
+    assert(g_guest_errno_calls == errno_crossings + 1);   /* the refusal reached the guest: TL_ERRNO_END ran, it was not lost */
+    assert(g_guest_errno == ENOMEM);                     /* and as the guest's ENOMEM (12): a failure reported, not a success */
     assert(anon_total() == guest_before_failure);
 
     size_t page = (size_t)getpagesize();
