@@ -200,6 +200,10 @@ bool tl_unity_start(const tl_unity_config *cfg)
     U.cfg = *cfg;
     tl_set_data_dir(cfg->data_dir);
     tl_nwindow_configure(cfg->width, cfg->height, cfg->metal_layer);
+    /* The reservation prepared at launch is 4 GiB of address space, held back for the 8 GiB compressed-heap request V8's
+     * pointer-compression cage and Dart's heap make. A Unity engine never makes it, and this one is about to ask for its own
+     * reservations out of the same budget: give the 4 GiB back, and phantom_reserve makes another if something does ask. */
+    { void husk_release_unused_compressed_heap(void); husk_release_unused_compressed_heap(); }
     int n = tl_dexidx_open(cfg->apk_path);
     if (n < 0) { tl_log_line("unity: could not safely index the APK's DEX"); return false; }
     tl_log_line("unity: %d classes across the APK's DEX and splits", n);
